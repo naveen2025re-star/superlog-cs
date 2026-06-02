@@ -12,6 +12,7 @@ import {
   DeleteMessageCommand,
   type Message,
   ReceiveMessageCommand,
+  type ReceiveMessageCommandOutput,
   SQSClient,
   SendMessageCommand,
 } from "@aws-sdk/client-sqs";
@@ -466,15 +467,54 @@ export class IngestQueue {
     };
   }
 
+  // Set by stop(); flips the consume loops out of their receive cycle so a
+  // rolling deploy can drain cleanly instead of abandoning in-flight messages.
+  private shuttingDown = false;
+  // Aborts an idle long-poll ReceiveMessage immediately on stop() so draining
+  // does not wait out the full waitTimeSeconds before the loop notices.
+  private readonly shutdownController = new AbortController();
+  // Resolves once every consume loop has exited; stop() awaits it.
+  private consumersDone: Promise<void> | null = null;
+
   startConsumer(collectorUrl: string): void {
-    void Promise.all(
+    const loops = Promise.all(
       Array.from({ length: this.config.consumerConcurrency }, (_, index) =>
         this.consumeLoop(collectorUrl, index + 1),
       ),
-    ).catch((err: unknown) => {
+    );
+    // Resolves on a clean drain (stop()); rejects only on an unexpected loop
+    // failure, which we surface as a non-zero exit below.
+    this.consumersDone = loops.then(() => undefined);
+    loops.catch((err: unknown) => {
       this.logger.error({ err }, "ingest queue consumer stopped unexpectedly");
       process.exitCode = 1;
     });
+  }
+
+  /**
+   * Drain the consumer for a graceful shutdown (e.g. SIGTERM from an ECS rolling
+   * deploy). Stops issuing new ReceiveMessage calls, aborts any idle long-poll,
+   * and waits for in-flight messages to finish processing — each delivered
+   * message is deleted before its loop exits. Without this, a deploy kills the
+   * task mid-batch and the received-but-undeleted messages stay invisible for the
+   * full visibility timeout before redelivering, which pins SQS
+   * ApproximateAgeOfOldestMessage into a sawtooth and trips the ingest-lag page.
+   * Idempotent.
+   */
+  async stop(): Promise<void> {
+    if (this.shuttingDown) return;
+    this.shuttingDown = true;
+    this.shutdownController.abort();
+    this.logger.info(
+      { queueUrl: this.config.queueUrl },
+      "ingest queue consumer draining in-flight messages",
+    );
+    try {
+      await this.consumersDone;
+    } catch {
+      // An unexpected loop failure is already logged + flagged in startConsumer.
+    }
+    this.logger.info({ queueUrl: this.config.queueUrl }, "ingest queue consumer drained");
   }
 
   private async consumeLoop(collectorUrl: string, consumerId: number): Promise<void> {
@@ -489,21 +529,38 @@ export class IngestQueue {
       "ingest queue consumer started",
     );
 
-    for (;;) {
-      const result = await this.sqs.send(
-        new ReceiveMessageCommand({
-          QueueUrl: this.config.queueUrl,
-          MaxNumberOfMessages: this.config.batchSize,
-          WaitTimeSeconds: this.config.waitTimeSeconds,
-          VisibilityTimeout: this.config.visibilityTimeoutSeconds,
-        }),
-      );
+    while (!this.shuttingDown) {
+      let result: ReceiveMessageCommandOutput;
+      try {
+        result = await this.sqs.send(
+          new ReceiveMessageCommand({
+            QueueUrl: this.config.queueUrl,
+            MaxNumberOfMessages: this.config.batchSize,
+            WaitTimeSeconds: this.config.waitTimeSeconds,
+            VisibilityTimeout: this.config.visibilityTimeoutSeconds,
+          }),
+          { abortSignal: this.shutdownController.signal },
+        );
+      } catch (err) {
+        // stop() aborts the in-flight long-poll; that surfaces here as an abort
+        // error. Exit cleanly when draining; otherwise preserve the previous
+        // crash-on-unexpected-failure behaviour.
+        if (this.shuttingDown) break;
+        throw err;
+      }
 
+      // A batch received just before stop() is still drained: we finish
+      // processing (and deleting) it before the while-condition exits the loop.
       const messages = result.Messages ?? [];
       if (messages.length === 0) continue;
 
       await Promise.all(messages.map((message) => this.processMessage(message, collectorUrl)));
     }
+
+    this.logger.info(
+      { queueUrl: this.config.queueUrl, consumerId },
+      "ingest queue consumer stopped",
+    );
   }
 
   private async processMessage(message: Message, collectorUrl: string): Promise<void> {
