@@ -482,13 +482,18 @@ export class IngestQueue {
         this.consumeLoop(collectorUrl, index + 1),
       ),
     );
-    // Resolves on a clean drain (stop()); rejects only on an unexpected loop
-    // failure, which we surface as a non-zero exit below.
-    this.consumersDone = loops.then(() => undefined);
+    // Surface an unexpected loop failure as a non-zero exit.
     loops.catch((err: unknown) => {
       this.logger.error({ err }, "ingest queue consumer stopped unexpectedly");
       process.exitCode = 1;
     });
+    // Settles (never rejects) once every loop has exited, so stop() can await it
+    // without risking an unhandled rejection when a loop fails and stop() is
+    // never called. The failure itself is logged + flagged via loops.catch above.
+    this.consumersDone = loops.then(
+      () => undefined,
+      () => undefined,
+    );
   }
 
   /**
@@ -509,11 +514,9 @@ export class IngestQueue {
       { queueUrl: this.config.queueUrl },
       "ingest queue consumer draining in-flight messages",
     );
-    try {
-      await this.consumersDone;
-    } catch {
-      // An unexpected loop failure is already logged + flagged in startConsumer.
-    }
+    // consumersDone never rejects (see startConsumer); a loop failure is logged
+    // and surfaced as a non-zero exit there.
+    await this.consumersDone;
     this.logger.info({ queueUrl: this.config.queueUrl }, "ingest queue consumer drained");
   }
 

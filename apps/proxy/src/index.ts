@@ -461,10 +461,12 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
       await ingestQueue.stop();
     }
   } catch (err) {
+    // Exit non-zero so a failed drain is visible rather than masquerading as a
+    // clean stop.
     logger.error({ err }, "error during graceful shutdown");
-  } finally {
-    process.exit(0);
+    process.exit(1);
   }
+  process.exit(0);
 }
 process.once("SIGTERM", () => void shutdown("SIGTERM"));
 process.once("SIGINT", () => void shutdown("SIGINT"));
