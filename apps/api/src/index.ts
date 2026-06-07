@@ -33,11 +33,17 @@ import { shouldRunMigrationsOnBoot } from "./boot-migrations.js";
 import { mountDashboards } from "./dashboards.js";
 import { mountFeedbackAuthed, mountFeedbackPublic } from "./feedback.js";
 import { type GatewayVars, mountGateway } from "./gateway.js";
-import { mountGithubAuthed, mountGithubAuthorOAuth, mountGithubPublic } from "./github.js";
+import {
+  mergeGithubPullRequest,
+  mountGithubAuthed,
+  mountGithubAuthorOAuth,
+  mountGithubPublic,
+} from "./github.js";
 import { createApiHttpObservabilityMiddleware } from "./http-observability.js";
 import { mountImpersonation } from "./impersonation.js";
 import { buildIncidentListItem, shouldInlineIncidentListStats } from "./incidents/list.js";
 import { getPrDeliveryRetryEligibility } from "./incidents/pr-retry.js";
+import { buildIncidentPullRequestViews } from "./incidents/pr-view.js";
 import {
   buildIncidentStatsFromActivityRows,
   buildIncidentStatsFromIssues,
@@ -1928,6 +1934,126 @@ app.get("/api/projects/:projectId/incidents/:incidentId", async (c) => {
     agentRuns,
     timeline,
     pendingResolutionProposal: pendingProposalMap.get(incident.id) ?? null,
+  });
+});
+
+app.get("/api/projects/:projectId/incidents/:incidentId/pull-requests", async (c) => {
+  const projectId = c.req.param("projectId");
+  const incidentId = c.req.param("incidentId");
+  await requireProjectAccess(c, projectId);
+
+  const incident = await getProjectIncident(projectId, incidentId);
+  if (!incident) throw new HTTPException(404, { message: "incident not found" });
+
+  const [prs, agentRuns] = await Promise.all([
+    db.query.agentPullRequests.findMany({
+      where: eq(schema.agentPullRequests.incidentId, incidentId),
+      orderBy: [desc(schema.agentPullRequests.createdAt)],
+    }),
+    db.query.agentRuns.findMany({
+      where: eq(schema.agentRuns.incidentId, incidentId),
+    }),
+  ]);
+
+  return c.json(buildIncidentPullRequestViews(prs, agentRuns));
+});
+
+const VALID_MANUAL_MERGE_METHODS = new Set(["squash", "merge", "rebase"]);
+
+app.post("/api/projects/:projectId/incidents/:incidentId/pull-requests/:prId/merge", async (c) => {
+  const projectId = c.req.param("projectId");
+  const incidentId = c.req.param("incidentId");
+  const prId = c.req.param("prId");
+  await requireProjectAccess(c, projectId);
+
+  const incident = await getProjectIncident(projectId, incidentId);
+  if (!incident) throw new HTTPException(404, { message: "incident not found" });
+
+  const pr = await db.query.agentPullRequests.findFirst({
+    where: and(
+      eq(schema.agentPullRequests.id, prId),
+      eq(schema.agentPullRequests.incidentId, incidentId),
+    ),
+  });
+  if (!pr) throw new HTTPException(404, { message: "pull request not found" });
+  if (pr.state !== "open") {
+    throw new HTTPException(409, { message: `pull request is already ${pr.state}` });
+  }
+
+  const installation = await db.query.githubInstallations.findFirst({
+    where: eq(schema.githubInstallations.id, pr.installationId),
+  });
+  if (!installation || installation.revokedAt) {
+    throw new HTTPException(409, { message: "github installation is unavailable" });
+  }
+
+  const body = (await c.req.json().catch(() => ({}))) as { method?: unknown };
+  const method =
+    typeof body.method === "string" && VALID_MANUAL_MERGE_METHODS.has(body.method)
+      ? (body.method as "squash" | "merge" | "rebase")
+      : "squash";
+
+  const merged = await mergeGithubPullRequest({
+    installationId: installation.installationId,
+    repoFullName: pr.repoFullName,
+    prNumber: pr.prNumber,
+    method,
+  });
+
+  const now = new Date();
+  const [updatedPr] = await db
+    .update(schema.agentPullRequests)
+    .set({
+      state: "merged",
+      mergedAt: now,
+      closedAt: now,
+      headSha: merged.sha ?? pr.headSha,
+      lastSyncedAt: now,
+      updatedAt: now,
+    })
+    .where(eq(schema.agentPullRequests.id, pr.id))
+    .returning();
+
+  await db
+    .insert(schema.agentPrEvents)
+    .values({
+      agentPrId: pr.id,
+      kind: "pr_merged",
+      summary: `PR #${pr.prNumber} merged from dashboard`,
+      payload: { method, sha: merged.sha, prUrl: pr.url, repoFullName: pr.repoFullName },
+      providerEventId: `dashboard_merge:${pr.id}`,
+      occurredAt: now,
+    })
+    .onConflictDoNothing();
+
+  await resolveIncident({
+    incidentId: pr.incidentId,
+    kind: "agent_pr_merged",
+    reasonCode: "agent_pr_merged",
+    reasonText: `Resolved because agent PR #${pr.prNumber} (${pr.repoFullName}) was merged.`,
+    agentRunId: pr.agentRunId,
+    eventSummary: `Incident resolved because PR #${pr.prNumber} was merged.`,
+    eventDetail: {
+      agentPrId: pr.id,
+      repoFullName: pr.repoFullName,
+      prNumber: pr.prNumber,
+      prUrl: pr.url,
+      mergedByLogin: null,
+    },
+    eventDedupeKey: `incident_resolved:agent_pr:${pr.id}`,
+    resolvedAt: now,
+  });
+
+  const agentRun = await db.query.agentRuns.findFirst({
+    where: eq(schema.agentRuns.id, pr.agentRunId),
+  });
+
+  return c.json({
+    ok: true,
+    sha: merged.sha,
+    pullRequest: updatedPr
+      ? (buildIncidentPullRequestViews([updatedPr], agentRun ? [agentRun] : [])[0] ?? null)
+      : null,
   });
 });
 

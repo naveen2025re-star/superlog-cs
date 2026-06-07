@@ -1,6 +1,15 @@
 import { ChartIncreaseIcon, CheckmarkCircle02Icon } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
-import { type ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  lazy,
+  type ReactNode,
+  Suspense,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { type EvidenceLinkContext, EvidenceMarkdown } from "./EvidenceMarkdown.tsx";
 import { FeedbackTrigger } from "./FeedbackDialog.tsx";
@@ -12,6 +21,7 @@ import {
   type Incident,
   type IncidentEvent,
   type IncidentListItem,
+  type IncidentPullRequest,
   type IncidentSeverity,
   type IncidentStats,
   type Issue,
@@ -20,12 +30,14 @@ import {
   type PendingResolutionProposal,
   useDecideResolutionProposal,
   useIncident,
+  useIncidentPullRequests,
   useIncidentStats,
   useIncidents,
   useIssue,
   useIssueAgentRun,
   useIssues,
   useMe,
+  useMergeIncidentPullRequest,
   useRestartAgentRun,
   useRetryPrDelivery,
   useSilenceIssue,
@@ -34,6 +46,8 @@ import {
 } from "./api.ts";
 import { Btn, Chip } from "./design/ui.tsx";
 import { getIssueIncidentLinkState } from "./issue-incident-link-state.ts";
+
+const IncidentPrDiffView = lazy(() => import("./IncidentPrDiffView.tsx"));
 
 type IssueFilter = "active" | "silenced" | "all";
 type IncidentStatus = "open" | "resolved" | "autoresolved_noise" | "all";
@@ -1329,6 +1343,8 @@ export function IncidentDetailContent({
   restartingAgentRun?: boolean;
   retryingPrDelivery?: boolean;
 }) {
+  const [detailTab, setDetailTab] = useState<"incident" | "pr">("incident");
+
   return (
     <div className="space-y-8 p-4">
       <div className="flex items-start justify-between gap-3">
@@ -1363,63 +1379,229 @@ export function IncidentDetailContent({
         </div>
       </div>
 
-      <div className="space-y-2">
-        <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
-          <MetaInline label="Service" value={incident.service ?? "—"} />
-          <MetaInline label="Environment" value={incident.environment ?? "—"} />
+      <IncidentDetailTabs active={detailTab} onChange={setDetailTab} />
+
+      {detailTab === "incident" ? (
+        <>
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
+              <MetaInline label="Service" value={incident.service ?? "—"} />
+              <MetaInline label="Environment" value={incident.environment ?? "—"} />
+            </div>
+            <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
+              <MetaInline label="First seen" value={fmtRelative(incident.firstSeen)} />
+              <MetaInline label="Last seen" value={fmtRelative(incident.lastSeen)} />
+            </div>
+          </div>
+
+          <IncidentActivityPanel projectId={incident.projectId} incidentId={incident.id} />
+
+          {pendingResolutionProposal && onDecideProposal && (
+            <ResolutionProposalBanner
+              proposal={pendingResolutionProposal}
+              onConfirm={() => onDecideProposal(pendingResolutionProposal.id, "confirm")}
+              onDismiss={() => onDecideProposal(pendingResolutionProposal.id, "dismiss")}
+              deciding={!!decidingProposal}
+            />
+          )}
+
+          <div className="space-y-3">
+            <SectionHeading>Issues in this incident</SectionHeading>
+            {issues.length === 0 ? (
+              <p className="text-[12px] text-muted">none</p>
+            ) : (
+              <IssueList issues={issues} onViewIssue={onViewIssue} />
+            )}
+          </div>
+
+          <AgentRunView
+            incident={incident}
+            agentRun={agentRun}
+            agentRuns={agentRuns}
+            events={events}
+            eventsError={eventsError}
+            eventsLoading={eventsLoading}
+            onRestart={onRestartAgentRun}
+            onRetryPrDelivery={onRetryPrDelivery}
+            restarting={restartingAgentRun}
+            retryingPrDelivery={retryingPrDelivery}
+          />
+
+          <div className="mt-8 border-t border-border pt-6">
+            <IncidentTimeline
+              events={events}
+              eventsError={eventsError}
+              eventsLoading={eventsLoading}
+            />
+          </div>
+
+          <Btn
+            variant={incident.status === "open" ? "secondary" : "ghost"}
+            size="sm"
+            onClick={onToggleStatus}
+            loading={updatingIncident}
+            className="w-full justify-center"
+          >
+            {incident.status === "open" ? "Resolve incident" : "Reopen incident"}
+          </Btn>
+        </>
+      ) : (
+        <IncidentPullRequestPanel projectId={incident.projectId} incidentId={incident.id} />
+      )}
+    </div>
+  );
+}
+
+function IncidentDetailTabs({
+  active,
+  onChange,
+}: {
+  active: "incident" | "pr";
+  onChange: (tab: "incident" | "pr") => void;
+}) {
+  const tabs: { id: "incident" | "pr"; label: string }[] = [
+    { id: "incident", label: "Incident" },
+    { id: "pr", label: "PR" },
+  ];
+  return (
+    <div className="-mx-4 border-b border-border px-4">
+      <div className="flex gap-9">
+        {tabs.map((tab) => {
+          const selected = active === tab.id;
+          return (
+            <button
+              key={tab.id}
+              type="button"
+              onClick={() => onChange(tab.id)}
+              className={`relative h-11 text-[14px] font-medium transition-colors ${
+                selected ? "text-fg" : "text-muted hover:text-fg"
+              }`}
+            >
+              {tab.label}
+              {selected && (
+                <span className="absolute inset-x-0 bottom-0 h-[3px] bg-fg" aria-hidden />
+              )}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function IncidentPullRequestPanel({
+  projectId,
+  incidentId,
+}: {
+  projectId: string;
+  incidentId: string;
+}) {
+  const prs = useIncidentPullRequests(projectId, incidentId);
+  const mergePr = useMergeIncidentPullRequest(projectId, incidentId);
+  const [selectedPrId, setSelectedPrId] = useState<string | null>(null);
+
+  const selectedPr = prs.data?.find((pr) => pr.id === selectedPrId) ?? prs.data?.[0] ?? null;
+
+  useEffect(() => {
+    if (!prs.data?.length) {
+      setSelectedPrId(null);
+      return;
+    }
+    if (!selectedPrId || !prs.data.some((pr) => pr.id === selectedPrId)) {
+      setSelectedPrId(prs.data[0]!.id);
+    }
+  }, [prs.data, selectedPrId]);
+
+  if (prs.isLoading) {
+    return <p className="text-[12px] text-muted">Loading PR…</p>;
+  }
+  if (prs.error) {
+    return <p className="text-[12px] text-danger">Failed to load PR: {String(prs.error)}</p>;
+  }
+  if (!prs.data || prs.data.length === 0) {
+    return (
+      <div className="rounded-md border border-border bg-surface p-4">
+        <SectionHeading>Pull request</SectionHeading>
+        <p className="mt-2 text-[12px] text-muted">No PR has been opened for this incident.</p>
+      </div>
+    );
+  }
+  if (!selectedPr) return null;
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0 space-y-1">
+          <SectionHeading>Pull request</SectionHeading>
+          <a
+            href={selectedPr.url}
+            target="_blank"
+            rel="noreferrer"
+            className="block truncate text-[13px] font-medium text-fg hover:underline"
+          >
+            {selectedPr.repoFullName} #{selectedPr.prNumber}
+          </a>
+          <p className="truncate text-[12px] text-muted">
+            {selectedPr.title ?? selectedPr.branchName} into {selectedPr.baseBranch}
+          </p>
         </div>
-        <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
-          <MetaInline label="First seen" value={fmtRelative(incident.firstSeen)} />
-          <MetaInline label="Last seen" value={fmtRelative(incident.lastSeen)} />
+        <div className="flex items-center gap-2">
+          <Chip tone={selectedPr.state === "merged" ? "success" : "neutral"} dot>
+            {selectedPr.state}
+          </Chip>
+          {selectedPr.state === "open" && (
+            <Btn
+              size="sm"
+              variant="primary"
+              loading={mergePr.isPending}
+              onClick={() => mergePr.mutate({ prId: selectedPr.id })}
+            >
+              Merge PR
+            </Btn>
+          )}
         </div>
       </div>
 
-      <IncidentActivityPanel projectId={incident.projectId} incidentId={incident.id} />
-
-      {pendingResolutionProposal && onDecideProposal && (
-        <ResolutionProposalBanner
-          proposal={pendingResolutionProposal}
-          onConfirm={() => onDecideProposal(pendingResolutionProposal.id, "confirm")}
-          onDismiss={() => onDecideProposal(pendingResolutionProposal.id, "dismiss")}
-          deciding={!!decidingProposal}
-        />
+      {prs.data.length > 1 && (
+        <div className="flex gap-2 overflow-x-auto pb-1">
+          {prs.data.map((pr) => (
+            <button
+              key={pr.id}
+              type="button"
+              onClick={() => setSelectedPrId(pr.id)}
+              className={`shrink-0 rounded-sm border px-2.5 py-1 text-[12px] ${
+                selectedPr.id === pr.id
+                  ? "border-border-strong bg-surface-2 text-fg"
+                  : "border-border text-muted hover:text-fg"
+              }`}
+            >
+              #{pr.prNumber}
+            </button>
+          ))}
+        </div>
       )}
 
-      <div className="space-y-3">
-        <SectionHeading>Issues in this incident</SectionHeading>
-        {issues.length === 0 ? (
-          <p className="text-[12px] text-muted">none</p>
-        ) : (
-          <IssueList issues={issues} onViewIssue={onViewIssue} />
-        )}
-      </div>
+      {mergePr.error && (
+        <p className="rounded-sm border border-danger/40 bg-danger/10 px-3 py-2 text-[12px] text-danger">
+          Merge failed: {String(mergePr.error)}
+        </p>
+      )}
 
-      <AgentRunView
-        incident={incident}
-        agentRun={agentRun}
-        agentRuns={agentRuns}
-        events={events}
-        eventsError={eventsError}
-        eventsLoading={eventsLoading}
-        onRestart={onRestartAgentRun}
-        onRetryPrDelivery={onRetryPrDelivery}
-        restarting={restartingAgentRun}
-        retryingPrDelivery={retryingPrDelivery}
-      />
-
-      <div className="mt-8 border-t border-border pt-6">
-        <IncidentTimeline events={events} eventsError={eventsError} eventsLoading={eventsLoading} />
-      </div>
-
-      <Btn
-        variant={incident.status === "open" ? "secondary" : "ghost"}
-        size="sm"
-        onClick={onToggleStatus}
-        loading={updatingIncident}
-        className="w-full justify-center"
-      >
-        {incident.status === "open" ? "Resolve incident" : "Reopen incident"}
-      </Btn>
+      {!selectedPr.patch ? (
+        <div className="rounded-md border border-border bg-surface p-4">
+          <p className="text-[12px] text-muted">No patch body was recorded for this PR.</p>
+        </div>
+      ) : (
+        <Suspense
+          fallback={
+            <div className="min-h-[520px] rounded-md border border-border bg-surface p-4 text-[12px] text-muted">
+              Loading diff…
+            </div>
+          }
+        >
+          <IncidentPrDiffView patch={selectedPr.patch} patchKey={selectedPr.id} />
+        </Suspense>
+      )}
     </div>
   );
 }
