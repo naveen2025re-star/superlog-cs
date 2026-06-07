@@ -1437,6 +1437,24 @@ export type IncidentDetail = {
   pendingResolutionProposal: PendingResolutionProposal | null;
 };
 
+export type IncidentPullRequest = {
+  id: string;
+  agentRunId: string;
+  repoFullName: string;
+  prNumber: number;
+  url: string;
+  branchName: string;
+  baseBranch: string;
+  headSha: string | null;
+  state: "open" | "closed" | "merged";
+  title: string | null;
+  patch: string | null;
+  createdAt: string;
+  updatedAt: string;
+  mergedAt: string | null;
+  closedAt: string | null;
+};
+
 export function useIncidents(
   projectId: string | undefined,
   status: "open" | "resolved" | "autoresolved_noise" | "all" = "open",
@@ -1458,6 +1476,42 @@ export function useIncident(projectId: string | undefined, incidentId: string | 
     queryKey: ["incident", projectId, incidentId],
     queryFn: () => fetcher<IncidentDetail>(`/api/projects/${projectId}/incidents/${incidentId}`),
     enabled: !!projectId && !!incidentId,
+  });
+}
+
+export function useIncidentPullRequests(
+  projectId: string | undefined,
+  incidentId: string | undefined,
+  enabled = true,
+) {
+  const fetcher = useFetcher();
+  return useQuery({
+    queryKey: ["incident-prs", projectId, incidentId],
+    queryFn: () =>
+      fetcher<IncidentPullRequest[]>(
+        `/api/projects/${projectId}/incidents/${incidentId}/pull-requests`,
+      ),
+    enabled: !!projectId && !!incidentId && enabled,
+  });
+}
+
+export function useMergeIncidentPullRequest(projectId: string, incidentId: string) {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (vars: { prId: string; method?: "squash" | "merge" | "rebase" }) =>
+      fetcher<{ ok: true; sha: string | null; pullRequest: IncidentPullRequest | null }>(
+        `/api/projects/${projectId}/incidents/${incidentId}/pull-requests/${vars.prId}/merge`,
+        {
+          method: "POST",
+          body: JSON.stringify({ method: vars.method ?? "squash" }),
+        },
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["incidents", projectId] });
+      qc.invalidateQueries({ queryKey: ["incident", projectId, incidentId] });
+      qc.invalidateQueries({ queryKey: ["incident-prs", projectId, incidentId] });
+    },
   });
 }
 
