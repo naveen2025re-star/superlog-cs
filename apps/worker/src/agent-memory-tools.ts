@@ -98,7 +98,9 @@ export type AgentMemoryToolContext = {
 
 // Dispatchers only carry { sessionId, orgId, incidentId }; memory writes also
 // need the project scope and run provenance. Resolves both from the incident
-// row and the run's provider session id.
+// row and the run's provider session id. Returns null when the incident's
+// project does not belong to args.orgId, so a mismatched dispatch can never
+// persist a memory that mixes tenants.
 export async function resolveAgentMemoryToolContext(args: {
   orgId: string;
   incidentId: string;
@@ -109,6 +111,11 @@ export async function resolveAgentMemoryToolContext(args: {
     columns: { projectId: true },
   });
   if (!incident) return null;
+  const project = await db.query.projects.findFirst({
+    where: and(eq(schema.projects.id, incident.projectId), eq(schema.projects.orgId, args.orgId)),
+    columns: { id: true },
+  });
+  if (!project) return null;
   const run = await db.query.agentRuns.findFirst({
     where: eq(schema.agentRuns.providerSessionId, args.sessionId),
     columns: { id: true },

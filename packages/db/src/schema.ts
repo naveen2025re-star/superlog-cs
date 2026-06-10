@@ -6,12 +6,14 @@ import {
   check,
   customType,
   doublePrecision,
+  foreignKey,
   index,
   integer,
   jsonb,
   pgTable,
   text,
   timestamp,
+  unique,
   uniqueIndex,
   uuid,
 } from "drizzle-orm/pg-core";
@@ -359,6 +361,9 @@ export const projects = pgTable(
   },
   (t) => ({
     uniq: uniqueIndex("projects_org_slug_idx").on(t.orgId, t.slug),
+    // Lets child tables carry (project_id, org_id) composite FKs that
+    // guarantee the project belongs to the same org as the row.
+    idOrgUniq: unique("projects_id_org_uniq").on(t.id, t.orgId),
   }),
 );
 
@@ -1376,6 +1381,20 @@ export const agentMemories = pgTable(
   },
   (t) => ({
     orgStatusIdx: index("agent_memories_org_status_idx").on(t.orgId, t.status),
+    // When project-scoped, the project must belong to the same org. Backed by
+    // the projects_id_org_uniq constraint on projects (added one migration
+    // earlier — the FK depends on it).
+    projectOrgFk: foreignKey({
+      name: "agent_memories_project_org_fk",
+      columns: [t.projectId, t.orgId],
+      foreignColumns: [projects.id, projects.orgId],
+    }).onDelete("cascade"),
+    // At most one author: agent-run provenance or user provenance, never both.
+    // Both may be null — ON DELETE SET NULL on either source requires it.
+    singleSourceCheck: check(
+      "agent_memories_single_source_check",
+      sql`NOT (source_agent_run_id IS NOT NULL AND source_user_id IS NOT NULL)`,
+    ),
   }),
 );
 
