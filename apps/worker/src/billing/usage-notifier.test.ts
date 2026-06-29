@@ -5,6 +5,7 @@ import {
   type UsageNotificationEvent,
   type UsageNotifierDeps,
   buildUsageSlackText,
+  isFreePlan,
   mapAutumnFeatures,
   notifyOrgUsage,
 } from "./usage-notifier.js";
@@ -146,17 +147,31 @@ test("a billing-provider error (null usage) is a silent no-op", async () => {
   assert.equal(h.events.length, 0);
 });
 
-test("mapAutumnFeatures reads granted/usage/flags and skips missing features", () => {
+test("mapAutumnFeatures reads granted/usage/flags from balances, skips missing", () => {
+  // Shape from a live Autumn GET /v1/customers/{id}: balances keyed by feature_id.
   const balances = mapAutumnFeatures({
-    features: {
+    balances: {
       spans: {
-        included_usage: 1_000_000,
+        feature_id: "spans",
+        granted: 1_000_000,
         usage: 500_000,
         overage_allowed: false,
         unlimited: false,
       },
-      logs: { included: 5_000_000, used: 100, overageAllowed: true },
-      investigations: { unlimited: true, usage: 3 },
+      logs: {
+        feature_id: "logs",
+        granted: 5_000_000,
+        usage: 100,
+        overage_allowed: true,
+        unlimited: false,
+      },
+      investigations: {
+        feature_id: "investigations",
+        granted: 0,
+        usage: 3,
+        overage_allowed: false,
+        unlimited: true,
+      },
       // metric_points omitted → skipped
     },
   });
@@ -173,10 +188,87 @@ test("mapAutumnFeatures reads granted/usage/flags and skips missing features", (
   ]);
 });
 
-test("mapAutumnFeatures tolerates a missing/empty features object", () => {
+test("mapAutumnFeatures tolerates a missing/empty balances object", () => {
   assert.deepEqual(mapAutumnFeatures(null), []);
   assert.deepEqual(mapAutumnFeatures({}), []);
-  assert.deepEqual(mapAutumnFeatures({ features: {} }), []);
+  assert.deepEqual(mapAutumnFeatures({ balances: {} }), []);
+});
+
+test("isFreePlan: only true when every active subscription is the free plan", () => {
+  // Free org (auto-enabled free subscription)
+  assert.equal(isFreePlan({ subscriptions: [{ plan_id: "free", status: "active" }] }), true);
+  // Paying org (grandfathered) — the Trellis case: hard-capped feature but NOT free
+  assert.equal(
+    isFreePlan({ subscriptions: [{ plan_id: "grandfathered", status: "active" }] }),
+    false,
+  );
+  assert.equal(isFreePlan({ subscriptions: [{ plan_id: "payg", status: "active" }] }), false);
+  // free + a paid add-on → not free
+  assert.equal(
+    isFreePlan({
+      subscriptions: [
+        { plan_id: "free", status: "active" },
+        { plan_id: "pack_150", status: "active" },
+      ],
+    }),
+    false,
+  );
+  // canceled-at-period-end paid sub still grants access (canceled_at set,
+  // expires_at in the future) → NOT free, even alongside a free sub. This is the
+  // cubic P1: don't drop a paid sub just because canceled_at is present.
+  assert.equal(
+    isFreePlan(
+      {
+        subscriptions: [
+          { plan_id: "free", status: "active" },
+          { plan_id: "payg", status: "active", canceled_at: 1000, expires_at: 5000 },
+        ],
+      },
+      2000, // now < expires_at → paid access still live
+    ),
+    false,
+  );
+  // genuinely-lapsed paid sub (expires_at in the past) is ignored; remaining
+  // active free → free.
+  assert.equal(
+    isFreePlan(
+      {
+        subscriptions: [
+          { plan_id: "free", status: "active" },
+          { plan_id: "payg", status: "active", canceled_at: 1000, expires_at: 5000 },
+        ],
+      },
+      9000, // now > expires_at → paid access has lapsed
+    ),
+    true,
+  );
+  // status `expired` paid sub is ignored regardless of timestamps.
+  assert.equal(
+    isFreePlan({
+      subscriptions: [
+        { plan_id: "free", status: "active" },
+        { plan_id: "payg", status: "expired" },
+      ],
+    }),
+    true,
+  );
+  // a `scheduled` future paid sub hasn't started → doesn't grant access yet, so
+  // the org is still Free today (it would otherwise be wrongly excluded).
+  assert.equal(
+    isFreePlan({
+      subscriptions: [
+        { plan_id: "free", status: "active" },
+        { plan_id: "payg", status: "scheduled" },
+      ],
+    }),
+    true,
+  );
+  // a trialing paid sub grants access → not free.
+  assert.equal(isFreePlan({ subscriptions: [{ plan_id: "payg", status: "trialing" }] }), false);
+  // no active subscriptions / unknown shape → not free (stay silent)
+  assert.equal(isFreePlan({ subscriptions: [] }), false);
+  assert.equal(isFreePlan(null), false);
+  assert.equal(isFreePlan({}), false);
 });
 
 test("100% Slack copy differs by enforcement + feature", () => {

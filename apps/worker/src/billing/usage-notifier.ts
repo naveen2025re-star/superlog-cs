@@ -35,27 +35,56 @@ function num(value: unknown): number {
 }
 
 // Map an Autumn `GET /v1/customers/{id}` response body to our FeatureBalance[].
-// Pure + defensive: Autumn's REST balance field names are read with fallbacks
-// (the exact shape should be confirmed against a live response — see the verify
-// step). A feature missing from the response is simply skipped.
+// Confirmed against a live response: balances live under `balances`, keyed by
+// feature_id, each `{ granted, usage, unlimited, overage_allowed, ... }`. A
+// feature missing from the response is simply skipped.
 export function mapAutumnFeatures(body: unknown): FeatureBalance[] {
-  const features = (body as { features?: Record<string, unknown> } | null)?.features;
-  if (!features || typeof features !== "object") return [];
+  const balances = (body as { balances?: Record<string, unknown> } | null)?.balances;
+  if (!balances || typeof balances !== "object") return [];
   const out: FeatureBalance[] = [];
   for (const featureId of USAGE_FEATURE_IDS) {
-    const f = (features as Record<string, Record<string, unknown>>)[featureId];
-    if (!f || typeof f !== "object") continue;
-    const granted = num(f.included_usage ?? f.included ?? f.allowance ?? f.granted ?? f.limit);
-    const usage = num(f.usage ?? f.used);
+    const b = (balances as Record<string, Record<string, unknown>>)[featureId];
+    if (!b || typeof b !== "object") continue;
     out.push({
       featureId,
-      usage,
-      granted,
-      overageAllowed: f.overage_allowed === true || f.overageAllowed === true,
-      unlimited: f.unlimited === true,
+      usage: num(b.usage),
+      granted: num(b.granted),
+      overageAllowed: b.overage_allowed === true,
+      unlimited: b.unlimited === true,
     });
   }
   return out;
+}
+
+// Usage-limit warnings + enforcement apply to the FREE plan only. A paying tier
+// (grandfathered / payg / packs / internal) can still have a hard-capped feature
+// with no overage — so "has a hard cap" is NOT the same as "Free". Gate on the
+// org's actual Autumn subscriptions instead: free iff every subscription that
+// still grants access is the `free` plan. Unknown/absent subscriptions → not
+// free (safer to stay silent than to warn or block a paying customer).
+//
+// Only count subscriptions that grant access *right now*:
+//   - status is access-granting (active / trialing / past_due). A `scheduled`
+//     future plan hasn't started, and `expired`/lapsed plans are gone — neither
+//     reflects what the org is entitled to today.
+//   - and the access window hasn't elapsed (`expires_at` in the past).
+// A paid plan canceled at period end keeps `status:"active"` with `canceled_at`
+// set and `expires_at` in the future, so it stays live and (correctly) keeps the
+// org out of the Free cohort — `canceled_at` alone must NOT drop it, otherwise a
+// still-paying org with a parallel free subscription would look Free and get
+// warned/enforced.
+const FREE_PLAN_ID = "free";
+const ACCESS_STATUSES = new Set(["active", "trialing", "past_due"]);
+export function isFreePlan(body: unknown, now: number = Date.now()): boolean {
+  const subs = (body as { subscriptions?: Array<Record<string, unknown>> } | null)?.subscriptions;
+  if (!Array.isArray(subs)) return false;
+  const live = subs.filter((s) => {
+    if (!ACCESS_STATUSES.has(String(s.status))) return false;
+    const expiresAt = typeof s.expires_at === "number" ? s.expires_at : null;
+    if (expiresAt !== null && expiresAt <= now) return false;
+    return true;
+  });
+  return live.length > 0 && live.every((s) => s.plan_id === FREE_PLAN_ID);
 }
 
 // Structured payload handed to the Loops event sender (the email copy lives in a
