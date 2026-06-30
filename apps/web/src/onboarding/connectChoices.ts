@@ -9,7 +9,7 @@
 
 // What activating a row does. `null` => not yet available (coming soon), so the
 // row renders disabled and is not actionable.
-export type ConnectAction = "aws" | "otel" | "code";
+export type ConnectAction = "aws" | "cloudflare" | "otel" | "code";
 
 // Glyph key resolved to a neutral monochrome icon by the component. Kept as a
 // string union (not a component) so this module stays free of JSX/React.
@@ -52,6 +52,14 @@ export const CONNECT_SECTIONS: ConnectSection[] = [
           "Stream CloudWatch logs and metrics and auto-discover resources from one CloudFormation stack. No agent, no code.",
         icon: "aws",
         action: "aws",
+      },
+      {
+        id: "cloudflare",
+        title: "Cloudflare",
+        description:
+          "Authorize Cloudflare once and we set up Workers Observability destinations that stream your Workers traces, logs, and metrics in. No agent, no code.",
+        icon: "cloudflare",
+        action: "cloudflare",
       },
       {
         id: "otel",
@@ -97,13 +105,6 @@ export const CONNECT_SECTIONS: ConnectSection[] = [
         action: null,
       },
       {
-        id: "cloudflare",
-        title: "Cloudflare",
-        description: "Coming soon",
-        icon: "cloudflare",
-        action: null,
-      },
-      {
         id: "github-actions",
         title: "GitHub Actions",
         description: "Coming soon",
@@ -113,6 +114,27 @@ export const CONNECT_SECTIONS: ConnectSection[] = [
     ],
   },
 ];
+
+// Runtime availability for connectors that depend on server-side config. The
+// backend self-disables the Cloudflare connector when its OAuth client / OTLP
+// intake env isn't set (see system-capabilities), so the chooser must not offer
+// a click that would 503 — it renders the tile as "coming soon" until the API
+// reports the connector is configured.
+export type ConnectAvailability = {
+  cloudflare: boolean;
+};
+
+export function connectSectionsFor(availability: ConnectAvailability): ConnectSection[] {
+  if (availability.cloudflare) return CONNECT_SECTIONS;
+  return CONNECT_SECTIONS.map((section) => ({
+    ...section,
+    options: section.options.map((option) =>
+      option.id === "cloudflare"
+        ? { ...option, action: null, description: "Coming soon", badge: undefined }
+        : option,
+    ),
+  }));
+}
 
 export function isComingSoon(option: ConnectOption): boolean {
   return option.action === null;
