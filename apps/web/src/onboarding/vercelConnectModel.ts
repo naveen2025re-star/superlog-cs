@@ -11,6 +11,13 @@
 
 export type VercelPhase = "start" | "connecting" | "connected";
 
+// Shown on every pre-connect surface (onboarding start panel, settings card)
+// so a Hobby-team user learns about the gate before the OAuth round-trip, not
+// from the drains_unavailable failure after it. Vercel only offers Drains —
+// the mechanism the integration streams telemetry through — on paid teams.
+export const VERCEL_PLAN_REQUIREMENT =
+  "Requires a Vercel Pro or Enterprise team — Vercel doesn't offer Drains on the Hobby (free) plan.";
+
 /**
  * Resolve the flow phase:
  *  - `installed`  → the OAuth round-trip finished and drains were created.
@@ -29,9 +36,10 @@ export function canContinueVercel(phase: VercelPhase): boolean {
   return phase === "connected";
 }
 
-// The OAuth callback redirects back with `?vercel=installed|denied|error|...`.
-// `installed` is handled by the install poll flipping to "connected"; failure
-// outcomes reset out of the waiting state rather than spin forever.
+// The OAuth callback lands on the /connect/vercel result page, whose
+// "Back to Superlog" link carries `?vercel=installed|denied|error|...` back to
+// `/`. `installed` is handled by the install poll flipping to "connected";
+// failure outcomes reset out of the waiting state rather than spin forever.
 export type VercelOutcome = "installed" | "denied" | "error" | "drains_unavailable" | null;
 
 export function parseVercelOutcome(value: string | null | undefined): VercelOutcome {
