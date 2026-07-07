@@ -189,10 +189,36 @@ if [[ "$SKIP_LINK" -eq 0 ]]; then
 fi
 
 if [[ ! -e apps/api/.env ]]; then
-  echo "==> apps/api/.env missing; writing dev-only BETTER_AUTH_SECRET fallback"
+  echo "==> apps/api/.env missing; writing dev-only secret fallbacks"
+  # STATE_SIGNING_SECRET signs connector OAuth `state` (Cloudflare / Vercel /
+  # Railway); AGENT_SECRETS_KEY encrypts integration secrets at rest. Without
+  # them every connector callback 503s or dies at the encrypt step, so a fresh
+  # worktree can't exercise any connect flow. Dev-only values — prod supplies
+  # real ones.
   cat > apps/api/.env <<EOF
 BETTER_AUTH_SECRET=${WT_NAME}-local-dev-better-auth-secret
+STATE_SIGNING_SECRET=${WT_NAME}-local-dev-state-signing-secret
+AGENT_SECRETS_KEY=$(openssl rand -base64 32)
 EOF
+fi
+
+# The worker decrypts the same integration secrets (e.g. the Railway puller's
+# tokens), so it needs the same AGENT_SECRETS_KEY the api encrypted with. Kept
+# in sync on every run (not just first write) so a regenerated apps/api/.env
+# can't leave the worker holding a stale key.
+if [[ -e apps/api/.env ]] && grep -q '^AGENT_SECRETS_KEY=' apps/api/.env; then
+  api_agent_key_line=$(grep '^AGENT_SECRETS_KEY=' apps/api/.env | head -1)
+  if [[ ! -e apps/worker/.env ]]; then
+    printf '%s\n' "$api_agent_key_line" > apps/worker/.env
+    echo "  wrote apps/worker/.env (AGENT_SECRETS_KEY shared with api)"
+  elif ! grep -qxF "$api_agent_key_line" apps/worker/.env; then
+    worker_env_tmp=$(mktemp)
+    grep -v '^AGENT_SECRETS_KEY=' apps/worker/.env > "$worker_env_tmp" || true
+    printf '%s\n' "$api_agent_key_line" >> "$worker_env_tmp"
+    cat "$worker_env_tmp" > apps/worker/.env
+    rm -f "$worker_env_tmp"
+    echo "  synced AGENT_SECRETS_KEY into apps/worker/.env (matched to api)"
+  fi
 fi
 
 # -----------------------------------------------------------------------------

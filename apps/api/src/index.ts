@@ -104,6 +104,7 @@ import {
   VALID_MANUAL_MERGE_METHODS,
   mergeAgentPullRequestAndResolveIncident,
 } from "./pr-merge-service.js";
+import { mountRailwayAuthed, mountRailwayPublic } from "./railway.js";
 import { mountSettingsAuthed } from "./settings.js";
 import { normalizeSignupIntentKeyHash, normalizeSignupIntentKeyPrefix } from "./signup-intents.js";
 import { mountSlackAuthed, mountSlackPublic } from "./slack.js";
@@ -288,6 +289,7 @@ mountMcpPublic(app, ch);
 mountSlackPublic(app);
 mountCloudflarePublic(app);
 mountVercelPublic(app);
+mountRailwayPublic(app);
 mountFeedbackPublic(app);
 // Management API (org-key auth, /api/v1/*) registers its own middleware
 // before the session middleware below — the session middleware skips
@@ -326,6 +328,7 @@ mountLinearAuthed(app);
 mountSlackAuthed(app);
 mountCloudflareAuthed(app);
 mountVercelAuthed(app);
+mountRailwayAuthed(app);
 mountSettingsAuthed(app);
 mountOrgKeyManagementAuthed(app);
 mountDashboards(app);

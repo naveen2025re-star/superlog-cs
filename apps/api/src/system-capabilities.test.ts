@@ -11,7 +11,35 @@ test("system capabilities default to the open-core community edition", () => {
     cloudUpgradeLinks: true,
     cloudflareConnect: false,
     vercelConnect: false,
+    railwayConnect: false,
   });
+});
+
+test("railwayConnect flips on only when client creds + both platform secrets are set", () => {
+  assert.equal(
+    buildSystemCapabilities({ RAILWAY_CLIENT_ID: "id", RAILWAY_CLIENT_SECRET: "secret" })
+      .railwayConnect,
+    false,
+  );
+  // Provisioning encrypts secrets at rest, so AGENT_SECRETS_KEY is part of the
+  // gate — without it the connect flow throws after consent.
+  assert.equal(
+    buildSystemCapabilities({
+      RAILWAY_CLIENT_ID: "id",
+      RAILWAY_CLIENT_SECRET: "secret",
+      STATE_SIGNING_SECRET: "s",
+    }).railwayConnect,
+    false,
+  );
+  assert.equal(
+    buildSystemCapabilities({
+      RAILWAY_CLIENT_ID: "id",
+      RAILWAY_CLIENT_SECRET: "secret",
+      STATE_SIGNING_SECRET: "s",
+      AGENT_SECRETS_KEY: "k",
+    }).railwayConnect,
+    true,
+  );
 });
 
 test("cloudflareConnect flips on only when all connector vars (incl. STATE_SIGNING_SECRET) are set", () => {
@@ -36,6 +64,7 @@ test("cloudflareConnect flips on only when all connector vars (incl. STATE_SIGNI
       CLOUDFLARE_CLIENT_SECRET: "secret",
       CLOUDFLARE_OTLP_INTAKE_URL: "https://intake.example.com",
       STATE_SIGNING_SECRET: "state-secret",
+      AGENT_SECRETS_KEY: "k",
     }).cloudflareConnect,
     true,
   );
@@ -56,6 +85,7 @@ test("system capabilities expose cloud billing and managed agents when explicitl
       cloudUpgradeLinks: false,
       cloudflareConnect: false,
       vercelConnect: false,
+      railwayConnect: false,
     },
   );
 });
@@ -83,6 +113,7 @@ test("vercelConnect flips on only when all connector vars (incl. STATE_SIGNING_S
       VERCEL_INTEGRATION_SLUG: "superlog",
       VERCEL_OTLP_INTAKE_URL: "https://intake.example.com",
       STATE_SIGNING_SECRET: "state-secret",
+      AGENT_SECRETS_KEY: "k",
     }).vercelConnect,
     true,
   );
