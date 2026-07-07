@@ -27,6 +27,24 @@ export type PendingContextEvent = {
   summary: string | null;
 };
 
+// A session can report "idle" while the model is actually mid-flight: the
+// collector acks a tool call, the model immediately issues its next one, and
+// a user.message steer sent in the same tick 400s with "waiting on responses
+// to events [...]". That race is inherent to steering from a poller — the
+// only correct handling is to skip this tick and retry on the next, when the
+// session is genuinely quiescent. Treating the 400 as fatal killed real runs
+// with `sync_failed`.
+export function isSessionBusyError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.includes("waiting on responses to events");
+}
+
+// "steered": the delta was delivered and the caller must stop this tick.
+// "busy": the session rejected the steer mid-flight; events stay pending and
+// the caller must ALSO stop this tick — proceeding could complete the run out
+// from under a pending human reply. "not_applicable": nothing to steer.
+export type IdleSteerOutcome = "steered" | "busy" | "not_applicable";
+
 export async function steerIdleRunnerWithPendingContext(opts: {
   snapshotStatus: string;
   pendingContextEvents: PendingContextEvent[];
@@ -35,18 +53,27 @@ export async function steerIdleRunnerWithPendingContext(opts: {
   incidentId: string;
   markEventsProcessed(ids: string[]): Promise<void>;
   notifySteered(incidentId: string): Promise<void>;
-}): Promise<boolean> {
+}): Promise<IdleSteerOutcome> {
   if (opts.snapshotStatus !== "idle" || opts.pendingContextEvents.length === 0) {
-    return false;
+    return "not_applicable";
   }
   const delta = opts.pendingContextEvents
     .map((event) => event.summary)
     .filter((value): value is string => !!value)
     .join("\n");
-  await opts.runner.steer(opts.sessionId, delta || "New issues joined the incident.");
+  try {
+    await opts.runner.steer(opts.sessionId, delta || "New issues joined the incident.");
+  } catch (err) {
+    if (isSessionBusyError(err)) {
+      // Model is mid-tool-call despite the idle status; leave the events
+      // unprocessed so the next tick retries the steer.
+      return "busy";
+    }
+    throw err;
+  }
   await opts.markEventsProcessed(opts.pendingContextEvents.map((event) => event.id));
   await opts.notifySteered(opts.incidentId);
-  return true;
+  return "steered";
 }
 
 const MOBILE_FILE_PREFIXES = ["app/", "ios/", "android/", "components/", "screens/"];
@@ -250,7 +277,7 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
       // Oldest → newest so the steered conversation reads in chronological order.
       orderBy: [asc(schema.incidentEvents.createdAt)],
     });
-    const steeredHuman = await steerIdleRunnerWithPendingContext({
+    const steeredHumanOutcome = await steerIdleRunnerWithPendingContext({
       snapshotStatus: snapshot.status,
       pendingContextEvents: pendingHumanReplies,
       runner,
@@ -264,7 +291,10 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
       },
       notifySteered: async () => {},
     });
-    if (steeredHuman) {
+    if (steeredHumanOutcome !== "not_applicable") {
+      // Steered: the reply is in the session, wait for its turn. Busy: the
+      // reply is still pending — do NOT fall through to completion, or the
+      // run would finish out from under it; retry next tick.
       return;
     }
 
@@ -332,7 +362,12 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
           }
 
           if (snapshot.status === "idle") {
-            await runner.steer(sessionId, mobileRegressionRepairPrompt());
+            try {
+              await runner.steer(sessionId, mobileRegressionRepairPrompt());
+            } catch (err) {
+              if (isSessionBusyError(err)) return;
+              throw err;
+            }
             logger.info(
               {
                 agent_run_id: ctx.agentRun.id,
@@ -459,7 +494,7 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
       ),
       orderBy: [desc(schema.incidentEvents.createdAt)],
     });
-    const steered = await steerIdleRunnerWithPendingContext({
+    const steeredContextOutcome = await steerIdleRunnerWithPendingContext({
       snapshotStatus: snapshot.status,
       pendingContextEvents,
       runner,
@@ -478,7 +513,7 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
         );
       },
     });
-    if (steered) {
+    if (steeredContextOutcome !== "not_applicable") {
       return;
     }
 
@@ -525,6 +560,12 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
               .delete(schema.incidentEvents)
               .where(eq(schema.incidentEvents.id, claimedRow.id))
               .catch(() => undefined);
+            if (isSessionBusyError(err)) {
+              // The model is still working (it produced a tool call between
+              // our collect pass and this steer) — not idle-stuck at all.
+              // Skip; the next tick re-evaluates.
+              return;
+            }
             throw err;
           }
         }
