@@ -15,6 +15,12 @@ const disabledRunnerBackend: AgentRunnerBackend = {
   async start() {
     throw new Error("agent runner backend is disabled");
   },
+  async startChat() {
+    throw new Error("agent runner backend is disabled");
+  },
+  async sendChatMessage() {
+    throw new Error("agent runner backend is disabled");
+  },
   async collect() {
     throw new Error("agent runner backend is disabled");
   },
@@ -26,6 +32,9 @@ const disabledRunnerBackend: AgentRunnerBackend = {
   },
   async dispatchIntegrationToolCalls() {
     return 0;
+  },
+  async dispatchChatToolCalls() {
+    return { handled: 0, repliesThisTurn: 0 };
   },
 };
 
@@ -73,9 +82,12 @@ function isAgentRunnerBackend(value: unknown): value is AgentRunnerBackend {
     typeof backend.name === "string" &&
     typeof backend.maxRepoResources === "number" &&
     typeof backend.start === "function" &&
+    typeof backend.startChat === "function" &&
+    typeof backend.sendChatMessage === "function" &&
     typeof backend.collect === "function" &&
     typeof backend.resume === "function" &&
     typeof backend.steer === "function" &&
-    typeof backend.dispatchIntegrationToolCalls === "function"
+    typeof backend.dispatchIntegrationToolCalls === "function" &&
+    typeof backend.dispatchChatToolCalls === "function"
   );
 }

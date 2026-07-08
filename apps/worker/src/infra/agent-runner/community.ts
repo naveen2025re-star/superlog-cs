@@ -49,6 +49,15 @@ export const communityRunnerBackend: AgentRunnerBackend = {
   async collect(sessionId) {
     return readSnapshot(sessionId);
   },
+  async startChat() {
+    // Chats need resumable provider sessions, which the static community
+    // runner doesn't have. The chat tick surfaces this as a friendly Slack
+    // reply instead of a silent failure.
+    throw new Error("agent chats are not supported on the community runtime");
+  },
+  async sendChatMessage() {
+    throw new Error("agent chats are not supported on the community runtime");
+  },
   async resume() {
     throw new Error("community runner sessions cannot be resumed");
   },
@@ -57,6 +66,9 @@ export const communityRunnerBackend: AgentRunnerBackend = {
   },
   async dispatchIntegrationToolCalls() {
     return 0;
+  },
+  async dispatchChatToolCalls() {
+    return { handled: 0, repliesThisTurn: 0 };
   },
 };
 

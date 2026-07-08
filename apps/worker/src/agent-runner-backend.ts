@@ -128,10 +128,45 @@ export type AgentRunnerSnapshot = {
   };
 };
 
+// A Slack Q&A chat session (see packages/db agent_chats): answers questions
+// about the project's code and telemetry, delivers replies through a custom
+// tool the worker dispatches, and never produces an investigation outcome.
+export type AgentChatStartInput = {
+  chatId: string;
+  projectId: string;
+  orgId: string;
+  projectName: string;
+  // The first question (mention already stripped).
+  question: string;
+  // Slack display handle of the asker, e.g. "<@U123>", when known.
+  requester: string | null;
+  repoCandidates: AgentRunnerRepoCandidate[];
+  mcpResource: string | null;
+  customInstructions: string;
+  memories: AgentRunnerMemory[];
+};
+
+export type AgentChatDispatchResult = {
+  // Tool calls served during this dispatch pass.
+  handled: number;
+  // Reply-tool calls observed since the turn's last user message (served now
+  // or on an earlier pass). Zero at idle means the agent never delivered an
+  // answer this turn and the caller should fall back to its last message.
+  repliesThisTurn: number;
+};
+
 export type AgentRunnerBackend = {
   name: string;
   maxRepoResources: number;
   start(input: AgentRunnerStartInput): Promise<{ sessionId: string }>;
+  // Chat sessions reuse collect(); creation and messaging differ (chat prompt
+  // + reply tool instead of the investigation outcome toolset — resume/steer
+  // wrap messages in investigation framing a chat must not inherit).
+  startChat(input: AgentChatStartInput): Promise<{ sessionId: string }>;
+  // Deliver a follow-up human message into a chat session. One method covers
+  // both the idle-resume and mid-turn-steer cases: they are the same provider
+  // event, only the investigation flow needs to distinguish them.
+  sendChatMessage(sessionId: string, message: string): Promise<void>;
   collect(sessionId: string): Promise<AgentRunnerSnapshot>;
   resume(sessionId: string, message: string): Promise<void>;
   steer(sessionId: string, message: string): Promise<void>;
@@ -140,4 +175,18 @@ export type AgentRunnerBackend = {
     orgId: string;
     incidentId: string;
   }): Promise<number>;
+  // Serve a chat session's pending tool calls (memory tools + the reply
+  // tool). `onReply` posts the reply text to the chat's channel — the worker
+  // owns Slack delivery; the backend only surfaces the calls and acks them
+  // (error-acks when onReply throws, so the agent knows delivery failed).
+  // `replyId` is stable across dispatch retries of the same tool call (the
+  // provider tool-use id): if a reply posted but its ack failed, the retry
+  // passes the same id and the worker's dedupe skips the re-post.
+  dispatchChatToolCalls(input: {
+    sessionId: string;
+    orgId: string;
+    projectId: string;
+    chatId: string;
+    onReply(text: string, replyId: string): Promise<void>;
+  }): Promise<AgentChatDispatchResult>;
 };

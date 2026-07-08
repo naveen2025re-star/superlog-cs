@@ -142,6 +142,12 @@ function makeDeps(
       onStart?.(input);
       return { sessionId: "session-1" };
     },
+    async startChat() {
+      throw new Error("not used");
+    },
+    async sendChatMessage() {
+      throw new Error("not used");
+    },
     async collect() {
       throw new Error("not used");
     },
@@ -152,6 +158,9 @@ function makeDeps(
       throw new Error("not used");
     },
     async dispatchIntegrationToolCalls() {
+      throw new Error("not used");
+    },
+    async dispatchChatToolCalls() {
       throw new Error("not used");
     },
   };

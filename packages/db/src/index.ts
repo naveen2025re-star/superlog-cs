@@ -76,6 +76,9 @@ export type {
   IntegrationOperation,
   IntegrationSecretSpec,
   AgentRun,
+  AgentChat,
+  AgentChatMessage,
+  AgentChatState,
   AgentMemory,
   AgentMemoryKind,
   AgentMemoryStatus,
@@ -173,6 +176,23 @@ export {
   type RecordInboundInteractionResult,
   type RequestFollowUpResult,
 } from "./agent-follow-up.js";
+export {
+  decideChatInbound,
+  findChatByAnchor,
+  listActiveAgentChats,
+  listPendingChatMessages,
+  markChatMessagesProcessed,
+  mentionsBot,
+  recordInboundChatMessage,
+  resolveChatInstallation,
+  stripBotMention,
+  type ChatInboundInput,
+  type ChatInboundVerdict,
+  type ChatInstallationCandidate,
+  type ChatInstallationResolution,
+  type RecordInboundChatMessageArgs,
+  type RecordInboundChatMessageResult,
+} from "./agent-chat.js";
 export {
   isActiveIncidentState,
   buildAgentRunIncidentPatch,
