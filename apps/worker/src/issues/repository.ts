@@ -1,4 +1,4 @@
-import { db, schema } from "@superlog/db";
+import { type DB, db, schema } from "@superlog/db";
 import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import type { IssueGroupingSource, IssueGroupingState, LinkedIncidentIssue } from "./domain.js";
 
@@ -22,9 +22,23 @@ export async function updateIssueGrouping(
     source?: IssueGroupingSource;
     reason?: string | null;
     incrementAttempt?: boolean;
+    // Only apply when the current state is 'pending' — used by a losing
+    // concurrent-intake racer to clear its own in-flight marker without
+    // clobbering the winner's recorded grouping verdict.
+    onlyIfPending?: boolean;
+    // Only apply when grouping isn't already decided: either untouched
+    // (source IS NULL on a fresh issue) or in a retryable state
+    // ('pending'/'failed'). Used by the out-of-lock 'pending' marker write so a
+    // losing concurrent racer can never overwrite the winner's recorded
+    // grouped/standalone verdict (which always carries a non-null source). A
+    // single-row predicate, so it re-evaluates correctly under READ COMMITTED
+    // when it contends with the winner's verdict write on the same row.
+    onlyIfUndecided?: boolean;
   },
+  // Injectable for tests; defaults to the shared connection.
+  database: DB = db,
 ): Promise<void> {
-  await db
+  await database
     .update(schema.issues)
     .set({
       groupingState: opts.state,
@@ -35,7 +49,19 @@ export async function updateIssueGrouping(
         ? { groupingAttemptCount: sql`${schema.issues.groupingAttemptCount} + 1` }
         : {}),
     })
-    .where(eq(schema.issues.id, issueId));
+    .where(
+      opts.onlyIfPending
+        ? and(eq(schema.issues.id, issueId), eq(schema.issues.groupingState, "pending"))
+        : opts.onlyIfUndecided
+          ? and(
+              eq(schema.issues.id, issueId),
+              or(
+                isNull(schema.issues.groupingSource),
+                inArray(schema.issues.groupingState, ["pending", "failed"]),
+              ),
+            )
+          : eq(schema.issues.id, issueId),
+    );
 }
 
 export async function findOpenIncidentCandidates(
@@ -111,6 +137,73 @@ export async function findIncident(incidentId: string): Promise<schema.Incident 
   return db.query.incidents.findFirst({
     where: eq(schema.incidents.id, incidentId),
   });
+}
+
+// The episode an alert-episode issue is 1:1 with (alert_episodes_issue_uniq
+// enforces the 1:1). Carries the alert identity used for same-alert grouping.
+export async function findAlertEpisodeForIssue(
+  issueId: string,
+): Promise<schema.AlertEpisode | undefined> {
+  return db.query.alertEpisodes.findFirst({
+    where: eq(schema.alertEpisodes.issueId, issueId),
+  });
+}
+
+// Serialize incident intake for one issue across concurrent worker tasks.
+// Intake's existing-link check is read-then-create, so two racers processing
+// the same issue (e.g. duplicate alert evaluations folding into one episode
+// issue) could each open an incident. The advisory xact lock (released at
+// commit/rollback) makes the second racer wait until the first's intake has
+// committed its incident link, so it re-lands on that link instead. Callers
+// keep notifications and other slow side effects OUTSIDE fn — the lock holds a
+// database connection open for fn's whole duration.
+export async function withIssueIntakeLock<T>(issueId: string, fn: () => Promise<T>): Promise<T> {
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${issueId}, 0))`);
+    return fn();
+  });
+}
+
+// Newest incident driven by an episode of the same alert+group, optionally
+// restricted to open incidents. Single query shape so the open-join and
+// latest-predecessor lookups can't drift apart.
+async function findNewestIncidentForAlert(
+  alertId: string,
+  groupKey: string,
+  opts: { openOnly: boolean },
+): Promise<schema.Incident | undefined> {
+  const rows = await db
+    .select({ incident: schema.incidents })
+    .from(schema.alertEpisodes)
+    .innerJoin(schema.incidents, eq(schema.incidents.id, schema.alertEpisodes.incidentId))
+    .where(
+      and(
+        eq(schema.alertEpisodes.alertId, alertId),
+        eq(schema.alertEpisodes.groupKey, groupKey),
+        opts.openOnly ? eq(schema.incidents.status, "open") : undefined,
+      ),
+    )
+    .orderBy(desc(schema.alertEpisodes.startedAt))
+    .limit(1);
+  return rows[0]?.incident;
+}
+
+// Newest open incident driven by an episode of the same alert+group — the
+// join target for a new breach while the previous one is still being handled.
+export async function findOpenIncidentForAlert(
+  alertId: string,
+  groupKey: string,
+): Promise<schema.Incident | undefined> {
+  return findNewestIncidentForAlert(alertId, groupKey, { openOnly: true });
+}
+
+// Newest incident (any status) driven by an episode of the same alert+group —
+// the predecessor a standalone new breach chains to when it's closed.
+export async function findLatestIncidentForAlert(
+  alertId: string,
+  groupKey: string,
+): Promise<schema.Incident | undefined> {
+  return findNewestIncidentForAlert(alertId, groupKey, { openOnly: false });
 }
 
 export async function linkIssueToIncident(opts: {

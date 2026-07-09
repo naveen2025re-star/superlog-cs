@@ -2,9 +2,12 @@
 // it joins an existing open incident or opens a new one.
 //
 // The decision is layered:
-//   1. Heuristic match (cheap, deterministic, runs on every issue).
-//   2. LLM grouping (only for runtime-error issues; alerts skip).
-//   3. Open a fresh incident.
+//   1. Heuristic match (cheap, deterministic, runs on every issue). For
+//      alert-episode issues this includes joining the open incident already
+//      driven by an episode of the same alert+group.
+//   2. LLM grouping (errors and alert episodes alike).
+//   3. Open a fresh incident — chained to the latest closed same-alert
+//      incident when the issue is a new breach of an already-seen alert.
 //
 // Each branch updates the issue's grouping metadata (state + source +
 // reason) so the operator can audit why something landed where it did.
@@ -31,6 +34,17 @@ export type IntakeRepository = {
   findLatestIncidentIssueLink(issueId: string): Promise<schema.IncidentIssue | undefined>;
   findIncident(incidentId: string): Promise<schema.Incident | undefined>;
   touchIncidentLastSeen(incidentId: string, lastSeen: Date): Promise<void>;
+  // The episode an alert-episode issue is 1:1 with — carries the alert
+  // identity (alertId + groupKey) that fingerprints no longer encode.
+  findAlertEpisodeForIssue(issueId: string): Promise<schema.AlertEpisode | undefined>;
+  // Newest open / newest overall incident driven by an episode of the same
+  // alert+group. "Open" is the join target for a new breach; "latest" (when
+  // closed) is the predecessor a standalone new breach chains to.
+  findOpenIncidentForAlert(alertId: string, groupKey: string): Promise<schema.Incident | undefined>;
+  findLatestIncidentForAlert(
+    alertId: string,
+    groupKey: string,
+  ): Promise<schema.Incident | undefined>;
   findOpenIncidentCandidates(
     issue: schema.Issue,
     opts: { filterService: boolean },
@@ -48,6 +62,13 @@ export type IntakeRepository = {
       source?: IssueGroupingSource;
       reason?: string | null;
       incrementAttempt?: boolean;
+      // Only apply when the current state is 'pending' (see the losing-racer
+      // path in the serialized create section).
+      onlyIfPending?: boolean;
+      // Only apply when grouping isn't already decided (source IS NULL) or is
+      // retryable ('pending'/'failed'). Guards the out-of-lock 'pending' marker
+      // so a losing racer can't clobber the winner's grouped/standalone verdict.
+      onlyIfUndecided?: boolean;
     },
   ): Promise<void>;
 };
@@ -56,7 +77,7 @@ export type IntakeLifecycle = {
   openRecurrence(opts: {
     previousIncident: schema.Incident;
     issue: schema.Issue;
-    origin: "resolved_issue_recurred" | "escalation_trigger";
+    origin: "resolved_issue_recurred" | "escalation_trigger" | "alert_breached_again";
     environment?: string | null;
   }): Promise<schema.Incident>;
   createOpen(opts: {
@@ -82,6 +103,14 @@ export type IntakeDeps = {
   lifecycle: IntakeLifecycle;
   analyzeGrouping: GroupingDecider;
   logger: IntakeLogger;
+  // Optional mutual-exclusion hook around the workflow's one read-then-create
+  // section (deciding on + creating/linking the incident, AFTER grouping
+  // analysis). Wired for alert-episode issues, where concurrent duplicates of
+  // the same issue can reach intake together. fn re-checks the issue's link
+  // first, so the racer that lost the lock re-lands on the winner's incident.
+  // Deliberately excludes the LLM grouping call — implementations may hold a
+  // database connection for fn's whole duration.
+  serializeCreate?: <T>(issueId: string, fn: () => Promise<T>) => Promise<T>;
 };
 
 export type IssueIntakeTransition = "new" | "recurred" | "escalated";
@@ -156,26 +185,138 @@ export async function ensureIncidentForIssueWorkflow(
     }
   }
 
-  const grouping = await findMatchingIncident(issue, deps);
-  let incident = grouping.match?.incident ?? null;
-  let createdIncident = false;
-
-  if (!incident) {
-    incident = await deps.lifecycle.createOpen({
-      projectId: issue.projectId,
-      service: issue.service,
-      environment: environmentFromResourceAttrs(issue.lastSample?.resourceAttrs),
-      title: issue.title,
-      firstSeen: issue.firstSeen,
-      lastSeen: issue.lastSeen,
+  // Alert-episode issues are fresh every breach, so the same-alert
+  // relationship lives on the episodes rather than the fingerprint: a new
+  // breach joins the alert's open incident when one exists, and remembers the
+  // latest closed one to chain to if it ends up standalone.
+  const alertContext = issue.kind === "alert" ? await loadAlertIncidentContext(issue, deps) : null;
+  if (alertContext?.openIncident) {
+    const open = alertContext.openIncident;
+    const linkedIssue = await deps.repo.linkIssueToIncident({ incident: open, issue });
+    await deps.repo.updateIssueGrouping(issue.id, {
+      state: "grouped",
+      source: "heuristic",
+      reason: "New episode of an alert whose incident is still open.",
     });
-    createdIncident = true;
+    const freshIncident = (await deps.repo.findIncident(open.id)) ?? open;
+    return {
+      incident: freshIncident,
+      createdIncident: false,
+      linkedIssue,
+      recurrenceIncident: false,
+    };
   }
 
-  const linkedIssue = await deps.repo.linkIssueToIncident({ incident, issue });
-  await markIssueGrouping(issue.id, grouping, deps.repo);
-  const freshIncident = (await deps.repo.findIncident(incident.id)) ?? incident;
-  return { incident: freshIncident, createdIncident, linkedIssue, recurrenceIncident: false };
+  const grouping = await findMatchingIncident(issue, deps);
+  const matched = grouping.match?.incident ?? null;
+
+  // The tail below is the workflow's one read-then-create section: everything
+  // above only joins existing incidents with idempotent writes. It runs under
+  // the optional serialization hook with a link re-check inside, so a racer
+  // that created the incident first wins and the loser re-lands on it. The
+  // grouping analysis (which can call an LLM) stays outside the hook.
+  const serialize = deps.serializeCreate ?? ((_issueId, fn) => fn());
+  return serialize(issue.id, async () => {
+    const raceLink = await deps.repo.findLatestIncidentIssueLink(issue.id);
+    if (raceLink) {
+      const existing = await deps.repo.findIncident(raceLink.incidentId);
+      if (existing) {
+        if (existing.status === "open") {
+          await deps.repo.touchIncidentLastSeen(existing.id, issue.lastSeen);
+        }
+        // This losing invocation may have written 'pending' during its own
+        // grouping analysis, possibly AFTER the winner recorded its verdict.
+        // Clear only that leftover marker (onlyIfPending guards the winner's
+        // recorded verdict) and record *this* evaluation's own grouping
+        // result rather than a hard-coded 'grouped/heuristic' — which would
+        // mislabel the issue when the winner actually went standalone/failed
+        // or grouped via the LLM.
+        await markIssueGrouping(issue.id, grouping, deps.repo, { onlyIfPending: true });
+        return {
+          incident: existing,
+          createdIncident: false,
+          linkedIssue: false,
+          recurrenceIncident: false,
+        };
+      }
+    }
+
+    if (!matched && alertContext?.previousIncident) {
+      const recurrence = await deps.lifecycle.openRecurrence({
+        previousIncident: alertContext.previousIncident,
+        issue,
+        origin: "alert_breached_again",
+        environment: environmentFromResourceAttrs(issue.lastSample?.resourceAttrs),
+      });
+      await deps.repo.updateIssueGrouping(issue.id, {
+        state: "standalone",
+        source: "heuristic",
+        reason: "New breach of an alert whose previous incident is closed; chained to it.",
+      });
+      return {
+        incident: recurrence,
+        createdIncident: true,
+        linkedIssue: true,
+        recurrenceIncident: true,
+      };
+    }
+
+    let incident = matched;
+    let createdIncident = false;
+    if (!incident) {
+      incident = await deps.lifecycle.createOpen({
+        projectId: issue.projectId,
+        service: issue.service,
+        environment: environmentFromResourceAttrs(issue.lastSample?.resourceAttrs),
+        title: issue.title,
+        firstSeen: issue.firstSeen,
+        lastSeen: issue.lastSeen,
+      });
+      createdIncident = true;
+    }
+
+    const linkedIssue = await deps.repo.linkIssueToIncident({ incident, issue });
+    await markIssueGrouping(issue.id, grouping, deps.repo);
+    const freshIncident = (await deps.repo.findIncident(incident.id)) ?? incident;
+    return { incident: freshIncident, createdIncident, linkedIssue, recurrenceIncident: false };
+  });
+}
+
+type AlertIncidentContext = {
+  openIncident: schema.Incident | null;
+  previousIncident: schema.Incident | null;
+};
+
+async function loadAlertIncidentContext(
+  issue: schema.Issue,
+  deps: IntakeDeps,
+): Promise<AlertIncidentContext | null> {
+  const episode = await deps.repo.findAlertEpisodeForIssue(issue.id);
+  if (!episode) return null;
+  const open = await deps.repo.findOpenIncidentForAlert(episode.alertId, episode.groupKey);
+  if (open) return { openIncident: open, previousIncident: null };
+  const latest = await deps.repo.findLatestIncidentForAlert(episode.alertId, episode.groupKey);
+  if (!latest) return { openIncident: null, previousIncident: null };
+  // Episodes keep pointing at the incident they originally drove; a merged
+  // incident's live row is the survivor at the end of the merge chain.
+  const live = await followMergeChain(latest, deps);
+  if (live.status === "open") return { openIncident: live, previousIncident: null };
+  return { openIncident: null, previousIncident: live };
+}
+
+async function followMergeChain(
+  incident: schema.Incident,
+  deps: IntakeDeps,
+): Promise<schema.Incident> {
+  let current = incident;
+  const seen = new Set<string>([current.id]);
+  while (current.status === "merged" && current.mergedIntoId && !seen.has(current.mergedIntoId)) {
+    const next = await deps.repo.findIncident(current.mergedIntoId);
+    if (!next) break;
+    seen.add(next.id);
+    current = next;
+  }
+  return current;
 }
 
 async function findMatchingIncident(issue: schema.Issue, deps: IntakeDeps): Promise<Grouping> {
@@ -183,14 +324,8 @@ async function findMatchingIncident(issue: schema.Issue, deps: IntakeDeps): Prom
   if (heuristic) {
     return { match: heuristic, standaloneSource: null, standaloneReason: null, failedReason: null };
   }
-  if (issue.kind === "alert") {
-    return {
-      match: null,
-      standaloneSource: "heuristic",
-      standaloneReason: "Alert issues are not LLM-grouped with runtime error incidents.",
-      failedReason: null,
-    };
-  }
+  // Alert-episode issues go through LLM grouping like errors do: a breach can
+  // be another manifestation of an incident opened by errors (or vice versa).
   return findLlmMatchingIncident(issue, deps);
 }
 
@@ -230,11 +365,16 @@ async function findLlmMatchingIncident(issue: schema.Issue, deps: IntakeDeps): P
 
   const project = await deps.repo.findProject(issue.projectId);
 
+  // This runs outside the serialized create section, so concurrent duplicates
+  // of the same issue can all reach it. Guard the marker with onlyIfUndecided
+  // so a racer that arrives after the winner already recorded its verdict
+  // (grouped/standalone, non-null source) can't overwrite it with 'pending'.
   await deps.repo.updateIssueGrouping(issue.id, {
     state: "pending",
     source: "llm",
     reason: "Waiting for LLM grouping.",
     incrementAttempt: true,
+    onlyIfUndecided: true,
   });
 
   try {
@@ -287,12 +427,18 @@ async function markIssueGrouping(
   issueId: string,
   grouping: Grouping,
   repo: Pick<IntakeRepository, "updateIssueGrouping">,
+  // Set by the losing concurrent-intake racer: apply only if the issue is
+  // still 'pending' so it clears its own leftover marker without clobbering
+  // the winner's recorded verdict.
+  opts?: { onlyIfPending?: boolean },
 ): Promise<void> {
+  const onlyIfPending = opts?.onlyIfPending;
   if (grouping.match) {
     await repo.updateIssueGrouping(issueId, {
       state: "grouped",
       source: grouping.match.source,
       reason: grouping.match.reason,
+      onlyIfPending,
     });
     return;
   }
@@ -301,6 +447,7 @@ async function markIssueGrouping(
       state: "failed",
       source: "llm",
       reason: grouping.failedReason,
+      onlyIfPending,
     });
     return;
   }
@@ -308,5 +455,6 @@ async function markIssueGrouping(
     state: "standalone",
     source: grouping.standaloneSource,
     reason: grouping.standaloneReason,
+    onlyIfPending,
   });
 }
