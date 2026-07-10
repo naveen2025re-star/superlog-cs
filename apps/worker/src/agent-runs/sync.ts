@@ -14,6 +14,7 @@ import { tryMergeAfterAgentRun } from "./merge.js";
 import { completeWithPullRequest, resolvePullRequestBaseBranch } from "./pr-delivery.js";
 import { applyIncidentMetadataFromResult } from "./result-metadata.js";
 import {
+  awaitingHumanSecondsFromEvents,
   exceededWallClockBudget,
   failAgentRun,
   isTransientError,
@@ -21,6 +22,40 @@ import {
 } from "./status.js";
 
 const agentRunLifecycle = createAgentRunLifecycle(db);
+
+// Wall-clock seconds a run has spent parked in `awaiting_human`, excluded from
+// the wall-clock budget so a run that legitimately waits on a human reply isn't
+// reaped the moment it resumes (prod incident 2026-07-09). Derived from the
+// run's lifecycle events; defaults to 0 if the lookup fails so a telemetry
+// hiccup can never make the budget stricter than it already was.
+async function loadAwaitingHumanSeconds(
+  agentRunId: string,
+  startedAt: Date | null,
+  now: Date,
+): Promise<number> {
+  if (!startedAt) return 0;
+  try {
+    const events = await db
+      .select({
+        kind: schema.incidentEvents.kind,
+        createdAt: schema.incidentEvents.createdAt,
+      })
+      .from(schema.incidentEvents)
+      .where(
+        and(
+          eq(schema.incidentEvents.agentRunId, agentRunId),
+          inArray(schema.incidentEvents.kind, ["awaiting_human", "resumed"]),
+        ),
+      );
+    return awaitingHumanSecondsFromEvents({ events, startedAt, now });
+  } catch (err) {
+    logger.error(
+      { err, scope: "agent_run", agent_run_id: agentRunId },
+      "failed to load awaiting_human duration for wall-clock budget; treating as 0",
+    );
+    return 0;
+  }
+}
 
 export type PendingContextEvent = {
   id: string;
@@ -183,6 +218,14 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
     return;
   }
 
+  // Time parked awaiting a human is excluded from every wall-clock check below.
+  // Computed once up front so the transient-error path in `catch` can reuse it.
+  const awaitingHumanSeconds = await loadAwaitingHumanSeconds(
+    ctx.agentRun.id,
+    ctx.agentRun.startedAt,
+    new Date(),
+  );
+
   try {
     const runner = await getAgentRunnerBackend(ctx.agentRun.runtime);
     const dispatched = await runner
@@ -233,6 +276,7 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
         startedAt: ctx.agentRun.startedAt,
         now: new Date(),
         maxRuntimeMinutes: ctx.automation.maxRuntimeMinutes,
+        awaitingHumanSeconds,
       })
     ) {
       await failAgentRun(
@@ -368,6 +412,7 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
               startedAt: ctx.agentRun.startedAt,
               now: new Date(),
               maxRuntimeMinutes: ctx.automation.maxRuntimeMinutes,
+              awaitingHumanSeconds,
             })
           ) {
             await failAgentRun(
@@ -629,6 +674,7 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
           startedAt: ctx.agentRun.startedAt,
           now: new Date(),
           maxRuntimeMinutes: ctx.automation.maxRuntimeMinutes,
+          awaitingHumanSeconds,
         })
       ) {
         await failAgentRun(

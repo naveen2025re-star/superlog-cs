@@ -28,11 +28,61 @@ export function exceededWallClockBudget(opts: {
   startedAt: Date | null;
   now: Date;
   maxRuntimeMinutes: number;
+  // Total seconds the run has spent parked in `awaiting_human`. This time is
+  // excluded from the budget: a run waiting on a human reply isn't stuck, and
+  // a human can legitimately take hours to answer. Without this a run that
+  // parked on `ask_human` gets reaped the moment it resumes, discarding a
+  // finished investigation (prod incident 2026-07-09).
+  awaitingHumanSeconds?: number;
 }): boolean {
   if (!opts.startedAt) return false;
-  const ageMs = opts.now.getTime() - opts.startedAt.getTime();
+  const parkedMs = Math.max(0, opts.awaitingHumanSeconds ?? 0) * 1_000;
+  const ageMs = opts.now.getTime() - opts.startedAt.getTime() - parkedMs;
   const budgetMs = WALL_CLOCK_MULTIPLIER * opts.maxRuntimeMinutes * 60_000;
   return ageMs > budgetMs;
+}
+
+// Wall-clock seconds a run spent parked in `awaiting_human` *within its
+// wall-clock measurement window* `[startedAt, now]`, derived from lifecycle
+// events. A managed-session pause (`pauseForHuman` from `running`) emits an
+// `awaiting_human` event and the matching `resumeRunning` emits `resumed`; we
+// pair each such open→close and sum the gaps, clamped to the window.
+//
+// Two things are deliberately excluded, both because the exclusion must never
+// exceed the age it's subtracted from (`now - startedAt`), or the wall-clock
+// backstop silently disables itself:
+//   - Parks before `startedAt` — a `repo_discovery` pause happens before the
+//     managed session (and `startedAt`) exists, so its time was never part of
+//     the age. Clamping to the window drops it.
+//   - A dangling `awaiting_human` with no matching `resumed`. The pre-session
+//     resume path (`requeueAfterHumanReply`) requeues *without* a `resumed`
+//     event, so an unclosed park is that repo-discovery pause — already over,
+//     its end untracked — not an active wait. Only closed intervals count.
+// Nested/duplicate `awaiting_human` events collapse to the earliest park start.
+export function awaitingHumanSecondsFromEvents(opts: {
+  events: ReadonlyArray<{ kind: string; createdAt: Date }>;
+  startedAt: Date | null;
+  now: Date;
+}): number {
+  if (!opts.startedAt) return 0;
+  const windowStart = opts.startedAt.getTime();
+  const windowEnd = opts.now.getTime();
+  const relevant = opts.events
+    .filter((e) => e.kind === "awaiting_human" || e.kind === "resumed")
+    .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+  let totalMs = 0;
+  let parkedSince: Date | null = null;
+  for (const event of relevant) {
+    if (event.kind === "awaiting_human") {
+      if (parkedSince === null) parkedSince = event.createdAt;
+    } else if (parkedSince !== null) {
+      const from = Math.max(parkedSince.getTime(), windowStart);
+      const to = Math.min(event.createdAt.getTime(), windowEnd);
+      if (to > from) totalMs += to - from;
+      parkedSince = null;
+    }
+  }
+  return Math.max(0, Math.round(totalMs / 1_000));
 }
 
 const TRANSIENT_ERROR_CODES = new Set([

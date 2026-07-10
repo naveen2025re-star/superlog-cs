@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   agentRunErrorLogMeta,
+  awaitingHumanSecondsFromEvents,
   exceededWallClockBudget,
   isTransientError,
   WALL_CLOCK_MULTIPLIER,
@@ -71,6 +72,159 @@ test("exceededWallClockBudget fires when wall-clock age exceeds maxRuntimeMinute
   assert.equal(
     exceededWallClockBudget({ startedAt, now: justOver, maxRuntimeMinutes }),
     true,
+  );
+});
+
+test("exceededWallClockBudget excludes time parked awaiting a human", () => {
+  // The prod case: agent diagnosed in ~2 min, called ask_human, parked for
+  // ~22h, then the human replied and it resumed. Without excluding the parked
+  // time the resumed run is instantly reaped even though it barely ran.
+  const startedAt = new Date("2026-07-09T00:00:00Z");
+  const maxRuntimeMinutes = 90;
+  const budgetMs = WALL_CLOCK_MULTIPLIER * maxRuntimeMinutes * 60_000; // 6h
+  // 22h later, but 21h 58m of it was spent parked awaiting the human.
+  const now = new Date(startedAt.getTime() + 22 * 60 * 60_000);
+  const awaitingHumanSeconds = 21 * 60 * 60 + 58 * 60; // active time ≈ 2 min
+
+  assert.equal(
+    exceededWallClockBudget({ startedAt, now, maxRuntimeMinutes, awaitingHumanSeconds }),
+    false,
+  );
+
+  // Same wall-clock age with no parking → over the 6h budget, still fires.
+  assert.equal(
+    exceededWallClockBudget({
+      startedAt,
+      now: new Date(startedAt.getTime() + budgetMs + 1_000),
+      maxRuntimeMinutes,
+      awaitingHumanSeconds: 0,
+    }),
+    true,
+  );
+
+  // Parked time that still leaves active time over budget → fires.
+  assert.equal(
+    exceededWallClockBudget({
+      startedAt,
+      now: new Date(startedAt.getTime() + budgetMs + 60 * 60_000), // 7h wall clock
+      maxRuntimeMinutes,
+      awaitingHumanSeconds: 30 * 60, // only 30 min parked → 6.5h active > 6h
+    }),
+    true,
+  );
+});
+
+test("awaitingHumanSecondsFromEvents sums a single park→resume gap", () => {
+  const startedAt = new Date("2026-07-09T00:35:00Z");
+  const park = new Date("2026-07-09T00:37:00Z");
+  const resume = new Date("2026-07-09T22:39:00Z"); // ~22h later
+  const events = [
+    { kind: "agent_run_started", createdAt: startedAt },
+    { kind: "awaiting_human", createdAt: park },
+    { kind: "resumed", createdAt: resume },
+  ];
+
+  assert.equal(
+    awaitingHumanSecondsFromEvents({ events, startedAt, now: new Date("2026-07-09T22:40:00Z") }),
+    Math.round((resume.getTime() - park.getTime()) / 1_000),
+  );
+});
+
+test("awaitingHumanSecondsFromEvents adds multiple park cycles", () => {
+  const startedAt = new Date("2026-07-08T23:59:00Z");
+  const events = [
+    { kind: "awaiting_human", createdAt: new Date("2026-07-09T00:00:00Z") },
+    { kind: "resumed", createdAt: new Date("2026-07-09T01:00:00Z") }, // 1h
+    { kind: "awaiting_human", createdAt: new Date("2026-07-09T02:00:00Z") },
+    { kind: "resumed", createdAt: new Date("2026-07-09T02:30:00Z") }, // 30m
+  ];
+
+  assert.equal(
+    awaitingHumanSecondsFromEvents({ events, startedAt, now: new Date("2026-07-09T03:00:00Z") }),
+    90 * 60,
+  );
+});
+
+test("awaitingHumanSecondsFromEvents excludes parks before startedAt (repo-discovery)", () => {
+  // A repo_discovery pause emits `awaiting_human` before the managed session
+  // starts, and the pre-session resume path requeues WITHOUT a `resumed`
+  // event. That dangling, pre-startedAt park must not be subtracted — doing so
+  // would silently disable the wall-clock backstop once the run starts.
+  const startedAt = new Date("2026-07-09T02:00:00Z");
+  const events = [
+    { kind: "awaiting_human", createdAt: new Date("2026-07-09T00:00:00Z") }, // pre-session, no resumed
+    { kind: "agent_run_started", createdAt: startedAt },
+  ];
+
+  assert.equal(
+    awaitingHumanSecondsFromEvents({ events, startedAt, now: new Date("2026-07-09T09:00:00Z") }),
+    0,
+  );
+});
+
+test("awaitingHumanSecondsFromEvents clamps a park that straddles startedAt", () => {
+  // Park opens before startedAt but the matching resume lands after it — only
+  // the portion inside [startedAt, now] counts.
+  const startedAt = new Date("2026-07-09T01:00:00Z");
+  const events = [
+    { kind: "awaiting_human", createdAt: new Date("2026-07-09T00:00:00Z") },
+    { kind: "resumed", createdAt: new Date("2026-07-09T01:30:00Z") }, // 30m after startedAt
+  ];
+
+  assert.equal(
+    awaitingHumanSecondsFromEvents({ events, startedAt, now: new Date("2026-07-09T02:00:00Z") }),
+    30 * 60,
+  );
+});
+
+test("awaitingHumanSecondsFromEvents does not count a dangling open park", () => {
+  // No matching `resumed` → the park's end is untracked; it must not extend to
+  // `now`. In the sync path the run is already `running`, so an unclosed
+  // `awaiting_human` here is a spent repo-discovery pause, not an active wait.
+  const startedAt = new Date("2026-07-09T00:00:00Z");
+  const events = [{ kind: "awaiting_human", createdAt: new Date("2026-07-09T00:10:00Z") }];
+
+  assert.equal(
+    awaitingHumanSecondsFromEvents({ events, startedAt, now: new Date("2026-07-09T05:00:00Z") }),
+    0,
+  );
+});
+
+test("awaitingHumanSecondsFromEvents is 0 when the run never parked", () => {
+  const startedAt = new Date("2026-07-09T00:00:00Z");
+  const events = [
+    { kind: "agent_run_started", createdAt: startedAt },
+    { kind: "report_findings", createdAt: new Date("2026-07-09T00:02:00Z") },
+  ];
+
+  assert.equal(
+    awaitingHumanSecondsFromEvents({ events, startedAt, now: new Date("2026-07-09T00:03:00Z") }),
+    0,
+  );
+});
+
+test("awaitingHumanSecondsFromEvents is 0 with no startedAt", () => {
+  const events = [
+    { kind: "awaiting_human", createdAt: new Date("2026-07-09T00:00:00Z") },
+    { kind: "resumed", createdAt: new Date("2026-07-09T01:00:00Z") },
+  ];
+
+  assert.equal(
+    awaitingHumanSecondsFromEvents({ events, startedAt: null, now: new Date("2026-07-09T02:00:00Z") }),
+    0,
+  );
+});
+
+test("awaitingHumanSecondsFromEvents tolerates unordered events", () => {
+  const startedAt = new Date("2026-07-08T23:59:00Z");
+  const events = [
+    { kind: "resumed", createdAt: new Date("2026-07-09T01:00:00Z") },
+    { kind: "awaiting_human", createdAt: new Date("2026-07-09T00:00:00Z") },
+  ];
+
+  assert.equal(
+    awaitingHumanSecondsFromEvents({ events, startedAt, now: new Date("2026-07-09T02:00:00Z") }),
+    60 * 60,
   );
 });
 
