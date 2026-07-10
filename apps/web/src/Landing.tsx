@@ -143,6 +143,12 @@ function TopNav({
               Docs
             </a>
             <a
+              href="/blog"
+              className="hidden text-[12px] font-medium text-muted transition-colors hover:text-fg sm:inline"
+            >
+              Blog
+            </a>
+            <a
               href="/changelog"
               className="hidden text-[12px] font-medium text-muted transition-colors hover:text-fg sm:inline"
             >
@@ -909,6 +915,12 @@ function Footer() {
                 className="text-[14px] font-medium text-muted transition-colors hover:text-fg"
               >
                 Pricing
+              </a>
+              <a
+                href="/blog"
+                className="text-[14px] font-medium text-muted transition-colors hover:text-fg"
+              >
+                Blog
               </a>
               <a
                 href="/changelog"
