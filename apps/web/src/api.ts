@@ -2461,6 +2461,59 @@ export function useDecideResolutionProposal(projectId: string) {
   });
 }
 
+// Resolve every "recovery detected" incident in one click by confirming each
+// incident's pending resolution proposal. There's no server-side bulk route —
+// we fan out to the same confirm endpoint the single-incident banner uses, so
+// each confirm still runs the full resolve + PR-close side effects and stays
+// race-safe. A proposal a teammate already decided comes back 409; that's the
+// one expected, benign outcome, so we count it as "already resolved" and keep
+// going. Any other failure (auth, 5xx, network) is unexpected — we rethrow so
+// the mutation lands in its error state instead of silently reporting success.
+// Returns how many confirms went through vs. were already resolved so the
+// caller can surface a partial result.
+export function useResolveAllRecoveryDetected(projectId: string) {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (targets: { incidentId: string; proposalId: string }[]) => {
+      // allSettled (not Promise.all) so every confirm finishes before we react
+      // — Promise.all would reject on the first failure while the remaining
+      // requests keep running in the background, letting a retry overlap the
+      // still-in-flight batch. Wait for the whole batch to quiesce, then rethrow
+      // the first unexpected failure so the mutation lands in its error state.
+      const results = await Promise.allSettled(
+        targets.map(async (t) => {
+          try {
+            await fetcher<{ ok: true }>(
+              `/api/projects/${projectId}/incidents/${t.incidentId}/resolution-proposals/${t.proposalId}/confirm`,
+              { method: "POST" },
+            );
+            return "resolved" as const;
+          } catch (err) {
+            if (err instanceof Error && err.message.startsWith("409:")) {
+              return "already" as const;
+            }
+            throw err;
+          }
+        }),
+      );
+      const failed = results.find((r) => r.status === "rejected");
+      if (failed) throw failed.reason;
+      const resolved = results.filter(
+        (r) => r.status === "fulfilled" && r.value === "resolved",
+      ).length;
+      return { resolved, alreadyResolved: results.length - resolved };
+    },
+    onSuccess: (_data, targets) => {
+      qc.invalidateQueries({ queryKey: ["incidents", projectId] });
+      for (const t of targets) {
+        qc.invalidateQueries({ queryKey: ["incident", projectId, t.incidentId] });
+        qc.invalidateQueries({ queryKey: ["incident-investigation", projectId, t.incidentId] });
+      }
+    },
+  });
+}
+
 export function useUpdateIncident(projectId: string) {
   const fetcher = useFetcher();
   const qc = useQueryClient();
