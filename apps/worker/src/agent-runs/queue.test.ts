@@ -13,6 +13,7 @@ import {
 type SentJob = { name: string; data: unknown; options: unknown };
 type InsertedJob = { name: string; jobs: Array<Record<string, unknown>> };
 type WorkHandler = (jobs: Array<{ id: string; data: unknown }>) => Promise<unknown>;
+type WorkOptions = { batchSize: number; localConcurrency?: number };
 
 function fakeBoss() {
   const sent: SentJob[] = [];
@@ -20,15 +21,17 @@ function fakeBoss() {
   const queues: Array<{ name: string; options: unknown }> = [];
   const schedules: Array<{ name: string; cron: string }> = [];
   const workers = new Map<string, WorkHandler>();
+  const workOptions = new Map<string, WorkOptions>();
   const ops: string[] = [];
   const boss: AgentRunQueueBoss = {
     async createQueue(name, options) {
       ops.push(`createQueue:${name}`);
       queues.push({ name, options });
     },
-    async work(name, _options, handler) {
+    async work(name, options, handler) {
       ops.push(`work:${name}`);
       workers.set(name, handler as WorkHandler);
+      workOptions.set(name, options as WorkOptions);
     },
     async send(name, data, options) {
       sent.push({ name, data, options });
@@ -43,7 +46,7 @@ function fakeBoss() {
       schedules.push({ name, cron });
     },
   };
-  return { boss, sent, inserted, queues, schedules, workers, ops };
+  return { boss, sent, inserted, queues, schedules, workers, workOptions, ops };
 }
 
 function runOf(id: string, state: string): schema.AgentRun {
@@ -100,6 +103,14 @@ test("registration creates both queues, workers, and the sweep schedule", async 
   assert.ok(fb.workers.get(AGENT_RUN_ADVANCE_QUEUE));
   assert.ok(fb.workers.get(AGENT_RUN_SWEEP_QUEUE));
   assert.deepEqual(fb.schedules, [{ name: AGENT_RUN_SWEEP_QUEUE, cron: "* * * * *" }]);
+  // Concurrency must come from independent single-job consumers, NOT a fetch
+  // batch: pg-boss completes a batch only when the whole handler resolves, so
+  // batchSize > 1 lets one hung provider call hold every slot hostage
+  // (observed in prod: one stuck sync pinned 10 jobs active for 15 minutes).
+  assert.deepEqual(fb.workOptions.get(AGENT_RUN_ADVANCE_QUEUE), {
+    batchSize: 1,
+    localConcurrency: 10,
+  });
   // The advance consumer must be registered LAST: the caller enables the
   // tick's batch-rotation fallback when registration throws, so a partial
   // failure must never leave a live advance consumer behind — that would
@@ -186,6 +197,75 @@ test("one job's failure is swallowed and the rest of the batch still runs", asyn
   ]);
 
   assert.deepEqual(calls, ["sync"], "the healthy job must still be processed");
+});
+
+test("a job exceeding the per-job timeout is abandoned and the handler resolves", async () => {
+  const fb = fakeBoss();
+  let lateFailureLogged = false;
+  const never = new Promise<void>(() => {});
+  const { deps } = makeDeps({
+    handlers: { start: () => never },
+  });
+  deps.jobTimeoutMs = 5;
+  deps.logger = {
+    warn: () => {},
+    error: () => {
+      lateFailureLogged = true;
+    },
+  };
+  await registerAgentRunQueue(fb.boss, deps);
+  const worker = fb.workers.get(AGENT_RUN_ADVANCE_QUEUE);
+  assert.ok(worker);
+
+  // Must resolve despite the hung handler — a hung provider call may only
+  // cost its own slot a bounded delay, never wedge the consumer.
+  await worker([{ id: "job-1", data: { agentRunId: "run-1" } }]);
+  assert.ok(lateFailureLogged, "the timeout must be logged");
+});
+
+test("a run with an abandoned in-flight attempt is not advanced concurrently", async () => {
+  const fb = fakeBoss();
+  let startCalls = 0;
+  let releaseHung: (() => void) | undefined;
+  const hung = new Promise<void>((resolve) => {
+    releaseHung = resolve;
+  });
+  const { deps, calls } = makeDeps({
+    handlers: {
+      start: async (ctx) => {
+        if (ctx.agentRun.id === "hung-run") {
+          startCalls += 1;
+          await hung;
+          return;
+        }
+        calls.push("start");
+      },
+    },
+  });
+  deps.jobTimeoutMs = 5;
+  deps.logger = { warn: () => {}, error: () => {} };
+  await registerAgentRunQueue(fb.boss, deps);
+  const worker = fb.workers.get(AGENT_RUN_ADVANCE_QUEUE);
+  assert.ok(worker);
+
+  // First attempt times out and is abandoned — but its promise is still
+  // running.
+  await worker([{ id: "job-1", data: { agentRunId: "hung-run" } }]);
+  assert.equal(startCalls, 1);
+
+  // A re-enqueued job for the same run must be skipped (no second concurrent
+  // attempt), while other runs advance normally.
+  await worker([{ id: "job-2", data: { agentRunId: "hung-run" } }]);
+  assert.equal(startCalls, 1, "the hung run must not be advanced concurrently");
+  await worker([{ id: "job-3", data: { agentRunId: "other-run" } }]);
+  assert.deepEqual(calls, ["start"], "other runs must be unaffected");
+
+  // Once the abandoned attempt finally settles, the run may be advanced again.
+  releaseHung?.();
+  await hung;
+  await new Promise((resolve) => setImmediate(resolve));
+  await worker([{ id: "job-4", data: { agentRunId: "hung-run" } }]);
+  assert.equal(startCalls, 2, "a settled run must be advanceable again");
 });
 
 test("sweep enqueues one deduped advance job per active run", async () => {
