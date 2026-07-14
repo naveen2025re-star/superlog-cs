@@ -164,7 +164,7 @@ export class DrizzleGcpConnectionRepository implements GcpConnectionRepository {
         .returning();
       if (!row) throw new Error("GCP connection not found");
       if (supersededConnectionId) {
-        await tx
+        const [revoked] = await tx
           .update(schema.gcpConnections)
           .set({ revokedAt: new Date(), updatedAt: new Date() })
           .where(
@@ -174,7 +174,14 @@ export class DrizzleGcpConnectionRepository implements GcpConnectionRepository {
               eq(schema.gcpConnections.status, "connected"),
               isNull(schema.gcpConnections.revokedAt),
             ),
-          );
+          )
+          .returning({ apiKeyId: schema.gcpConnections.apiKeyId });
+        if (revoked?.apiKeyId) {
+          await tx
+            .update(schema.apiKeys)
+            .set({ revokedAt: new Date() })
+            .where(and(eq(schema.apiKeys.id, revoked.apiKeyId), isNull(schema.apiKeys.revokedAt)));
+        }
       }
       return toDomain(row);
     });

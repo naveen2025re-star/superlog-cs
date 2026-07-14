@@ -134,6 +134,7 @@ test("replacing a connected GCP project removes its cloud resources before super
     ...connection,
     id: "old-connection-id",
     gcpProjectId: "acme-staging",
+    readerServiceAccountEmail: "legacy-reader@example.iam.gserviceaccount.com",
     gcpProjectNumber: "987654321098",
     status: "connected",
     topicName: "superlog-old-connection-id",
@@ -179,6 +180,7 @@ test("replacing a connected GCP project removes its cloud resources before super
     },
     async deprovision(input: GcpDeprovisioningInput) {
       events.push(`deprovision-${input.connectionId}`);
+      assert.equal(input.readerServiceAccountEmail, oldConnection.readerServiceAccountEmail);
       assert.deepEqual(input.provisioned, {
         gcpProjectNumber: "987654321098",
         topicName: "superlog-old-connection-id",

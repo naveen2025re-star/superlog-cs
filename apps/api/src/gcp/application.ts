@@ -68,7 +68,7 @@ export async function completeGcpConnect(input: {
         gcpProjectId: superseded.gcpProjectId,
         userAccessToken: accessToken,
         integrationProjectId: input.config.integrationProjectId,
-        readerServiceAccountEmail: input.config.readerServiceAccountEmail,
+        readerServiceAccountEmail: superseded.readerServiceAccountEmail,
         provisioned: await cleanupProvisioningResult(
           superseded,
           persistedProvisioningResult(superseded),
@@ -104,7 +104,7 @@ export async function completeGcpConnect(input: {
           gcpProjectId: connection.gcpProjectId,
           userAccessToken: accessToken,
           integrationProjectId: input.config.integrationProjectId,
-          readerServiceAccountEmail: input.config.readerServiceAccountEmail,
+          readerServiceAccountEmail: connection.readerServiceAccountEmail,
           provisioned: await cleanupProvisioningResult(connection, provisioned, input.repository),
         });
       } catch (cleanupError) {
@@ -142,7 +142,7 @@ function provisioningInput(
     gcpProjectId: connection.gcpProjectId,
     userAccessToken: accessToken,
     integrationProjectId: config.integrationProjectId,
-    readerServiceAccountEmail: config.readerServiceAccountEmail,
+    readerServiceAccountEmail: connection.readerServiceAccountEmail,
     pushServiceAccountEmail: config.pushServiceAccountEmail,
     pushAudience: config.pushAudience,
     pushEndpoint: `${config.pushEndpoint.replace(/\/$/, "")}/${connection.id}`,

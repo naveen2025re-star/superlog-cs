@@ -194,6 +194,58 @@ test("completing an older OAuth tab does not revoke a newer pending connection",
   assert.equal(stillPending?.revokedAt, null);
 });
 
+test("superseding a GCP connection revokes its ingest key", async () => {
+  const { user, project } = await seedProject();
+  const [ingestKey] = await db
+    .insert(schema.apiKeys)
+    .values({
+      projectId: project.id,
+      name: "GCP metrics puller",
+      keyPrefix: "sl_public_old",
+      keyHash: `gcp-superseded-${crypto.randomUUID()}`,
+    })
+    .returning();
+  assert.ok(ingestKey);
+  const [old, candidate] = await db
+    .insert(schema.gcpConnections)
+    .values([
+      {
+        projectId: project.id,
+        gcpProjectId: "acme-old",
+        readerServiceAccountEmail: config.readerServiceAccountEmail,
+        createdBy: user.id,
+        status: "connected",
+        apiKeyId: ingestKey.id,
+      },
+      {
+        projectId: project.id,
+        gcpProjectId: "acme-new",
+        readerServiceAccountEmail: config.readerServiceAccountEmail,
+        createdBy: user.id,
+      },
+    ])
+    .returning();
+  assert.ok(old && candidate);
+
+  await new DrizzleGcpConnectionRepository().markConnected(
+    candidate.id,
+    {
+      gcpProjectNumber: "123456789012",
+      topicName: `superlog-${candidate.id}`,
+      subscriptionName: `superlog-${candidate.id}`,
+      logSinkName: `superlog-${candidate.id}`,
+      logSinkWriterIdentity: "serviceAccount:cloud-logs@system.gserviceaccount.com",
+      monitoringViewerGrantCreated: true,
+    },
+    old.id,
+  );
+
+  const revokedKey = await db.query.apiKeys.findFirst({
+    where: eq(schema.apiKeys.id, ingestKey.id),
+  });
+  assert.ok(revokedKey?.revokedAt);
+});
+
 test("connecting after an overlapping callback cannot create a second active connection", async () => {
   const { user, project } = await seedProject();
   const inserted = await db
