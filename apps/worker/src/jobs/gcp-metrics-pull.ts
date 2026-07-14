@@ -2,14 +2,14 @@ import { decryptIntegrationSecret, schema } from "@superlog/db";
 import { createAwsFederatedGcpClient } from "@superlog/gcp-auth";
 import { and, eq, isNull } from "drizzle-orm";
 import { GoogleAuth } from "google-auth-library";
-import type { JobDefinition, JobDeps } from "../jobs.js";
-import { logger } from "../logger.js";
 import {
   type GcpMetricConnection,
   type GcpMetricsPullerStore,
   runGcpMetricsPullOnce,
 } from "../gcp/metrics-puller.js";
 import { GoogleMonitoringClient } from "../gcp/monitoring-client.js";
+import type { JobDefinition, JobDeps } from "../jobs.js";
+import { logger } from "../logger.js";
 
 const log = logger.child({ scope: "gcp-metrics-pull" });
 const DEFAULT_MONTHLY_SERIES_LIMIT = 100_000_000;
@@ -128,6 +128,10 @@ export const job: JobDefinition = {
     const integrationProjectId = process.env.GCP_INTEGRATION_PROJECT_ID;
     if (!integrationProjectId) {
       log.info({}, "GCP_INTEGRATION_PROJECT_ID not set — GCP metrics pull disabled");
+      return null;
+    }
+    if (!process.env.AGENT_SECRETS_KEY) {
+      log.info({}, "AGENT_SECRETS_KEY not set — GCP metrics pull disabled");
       return null;
     }
     const scopes = ["https://www.googleapis.com/auth/cloud-platform"];
