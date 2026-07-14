@@ -417,6 +417,76 @@ test("an empty poll does not checkpoint past delayed Cloud Monitoring samples", 
   assert.deepEqual(savedCursors, []);
 });
 
+test("an old metric cursor catches up in a bounded window without skipping backlog", async () => {
+  const windows: Array<{ metricType: string; startTime: Date; endTime: Date }> = [];
+  const savedCursors: Array<Record<string, Date>> = [];
+  await runGcpMetricsPullOnce({
+    now: () => new Date("2026-07-13T12:00:00Z"),
+    monthlySeriesLimit: 100,
+    store: {
+      async listConnected() {
+        return [
+          {
+            id: "connection-id",
+            projectId: "project-id",
+            gcpProjectId: "acme-production",
+            metricsCursors: {
+              "compute.googleapis.com/instance/cpu/utilization": new Date("2026-07-13T10:00:00Z"),
+            },
+            metricsBudgetMonth: "2026-07",
+            metricsSeriesRead: 0,
+            ingestKey: "sl_public_test",
+          },
+        ];
+      },
+      async reserveBudget(_id, reservation) {
+        return reservation.requested;
+      },
+      async refundBudget() {},
+      async saveCursors(_id, cursors) {
+        savedCursors.push(cursors);
+      },
+    },
+    monitoring: {
+      async listTimeSeries(input) {
+        windows.push({
+          metricType: input.metricType,
+          startTime: input.startTime,
+          endTime: input.endTime,
+        });
+        if (input.metricType !== "compute.googleapis.com/instance/cpu/utilization") {
+          return { timeSeries: [] };
+        }
+        return {
+          timeSeries: [
+            {
+              metric: { type: input.metricType },
+              resource: { type: "gce_instance" },
+              metricKind: "GAUGE",
+              points: [
+                {
+                  interval: { endTime: "2026-07-13T10:10:00Z" },
+                  value: { doubleValue: 0.5 },
+                },
+              ],
+            },
+          ],
+        };
+      },
+    },
+    async forward() {
+      return true;
+    },
+  });
+
+  assert.equal(windows[0]?.startTime.toISOString(), "2026-07-13T09:50:00.000Z");
+  assert.equal(windows[0]?.endTime.toISOString(), "2026-07-13T10:20:00.000Z");
+  assert.equal(
+    savedCursors[0]?.["compute.googleapis.com/instance/cpu/utilization"]?.toISOString(),
+    "2026-07-13T10:20:00.000Z",
+  );
+});
+
 test("overlap reads do not forward metric points at or before the delivered cursor", async () => {
   const forwarded: Array<{
     resourceMetrics: Array<{
@@ -481,7 +551,7 @@ test("overlap reads do not forward metric points at or before the delivered curs
     },
   });
 
-  assert.equal(starts[0]?.toISOString(), "2026-07-13T11:40:00.000Z");
+  assert.equal(starts[0]?.toISOString(), "2026-07-13T11:35:00.000Z");
   assert.equal(
     forwarded[0]?.resourceMetrics[0]?.scopeMetrics[0]?.metrics[0]?.gauge.dataPoints.length,
     1,

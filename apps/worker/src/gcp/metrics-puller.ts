@@ -10,6 +10,7 @@ export const CURATED_GCP_METRIC_TYPES = [
 ] as const;
 
 const GCP_METRICS_VISIBILITY_LAG_MS = 10 * 60 * 1000;
+const GCP_METRICS_CATCH_UP_WINDOW_MS = 20 * 60 * 1000;
 
 type GcpDistribution = {
   count?: string;
@@ -107,10 +108,14 @@ export async function runGcpMetricsPullOnce(input: {
 
       outer: for (const metricType of CURATED_GCP_METRIC_TYPES) {
         const metricCursor = connection.metricsCursors[metricType] ?? null;
-        const overlapStart = metricCursor
-          ? new Date(metricCursor.getTime() - 10 * 60 * 1000)
+        const startTime = metricCursor
+          ? new Date(metricCursor.getTime() - GCP_METRICS_VISIBILITY_LAG_MS)
           : earliest;
-        const startTime = overlapStart < earliest ? earliest : overlapStart;
+        const metricEndTime = metricCursor
+          ? new Date(
+              Math.min(endTime.getTime(), metricCursor.getTime() + GCP_METRICS_CATCH_UP_WINDOW_MS),
+            )
+          : endTime;
         let pageToken: string | undefined;
         do {
           // The store serializes this reservation on the connection row. That
@@ -136,7 +141,7 @@ export async function runGcpMetricsPullOnce(input: {
               gcpProjectId: connection.gcpProjectId,
               metricType,
               startTime,
-              endTime,
+              endTime: metricEndTime,
               pageSize,
               ...(pageToken ? { pageToken } : {}),
             });
@@ -185,6 +190,17 @@ export async function runGcpMetricsPullOnce(input: {
           }
           pageToken = page.nextPageToken;
         } while (pageToken);
+
+        // A fully scanned historical window is safe to checkpoint even when
+        // it contained no samples. This lets quiet metric types catch up after
+        // an outage without skipping the interval or replaying it forever.
+        if (
+          metricCursor &&
+          metricEndTime <= visibilityWatermark &&
+          (!deliveredCursors[metricType] || metricEndTime > deliveredCursors[metricType])
+        ) {
+          deliveredCursors[metricType] = metricEndTime;
+        }
       }
 
       if (deliveryFailed) continue;
