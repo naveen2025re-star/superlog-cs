@@ -185,6 +185,47 @@ test("deprovisioning preserves a monitoring viewer grant that predates the conne
   assert.equal(customerPolicyWrites.length, 0);
 });
 
+test("replacement cleanup preserves Pub/Sub delivery when the old sink cannot be removed", async () => {
+  const deletes: URL[] = [];
+  const fetchImpl: typeof fetch = async (input, init = {}) => {
+    const url = new URL(
+      typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url,
+    );
+    if (init.method === "DELETE") {
+      deletes.push(url);
+      if (url.hostname === "logging.googleapis.com") {
+        return Response.json({ error: { message: "permission denied" } }, { status: 403 });
+      }
+    }
+    return Response.json({});
+  };
+  const gateway = new GoogleGcpGateway(config, fetchImpl, async () => "service-access-token");
+
+  await assert.rejects(
+    gateway.deprovision({
+      connectionId: "old-connection-id",
+      gcpProjectId: "acme-staging",
+      userAccessToken: "temporary-user-token",
+      integrationProjectId: config.integrationProjectId,
+      readerServiceAccountEmail: config.readerServiceAccountEmail,
+      provisioned: {
+        gcpProjectNumber: "987654321098",
+        topicName: "superlog-old-connection-id",
+        subscriptionName: "superlog-old-connection-id",
+        logSinkName: "superlog-old-connection-id",
+        logSinkWriterIdentity: "serviceAccount:old-cloud-logs@system.gserviceaccount.com",
+        monitoringViewerGrantCreated: false,
+      },
+    }),
+    /permission denied/,
+  );
+
+  assert.deepEqual(
+    deletes.map((url) => url.hostname),
+    ["logging.googleapis.com"],
+  );
+});
+
 test("a later provisioning failure rolls back resources and IAM changes from that attempt", async () => {
   const requests: Array<{ url: URL; method: string; body: Record<string, unknown> }> = [];
   const fetchImpl: typeof fetch = async (input, init = {}) => {

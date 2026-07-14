@@ -9,9 +9,30 @@ export const CURATED_GCP_METRIC_TYPES = [
   "pubsub.googleapis.com/subscription/num_undelivered_messages",
 ] as const;
 
+type GcpDistribution = {
+  count?: string;
+  mean?: number;
+  range?: { min?: number; max?: number };
+  bucketOptions?: {
+    linearBuckets?: { numFiniteBuckets?: number; width?: number; offset?: number };
+    exponentialBuckets?: {
+      numFiniteBuckets?: number;
+      growthFactor?: number;
+      scale?: number;
+    };
+    explicitBuckets?: { bounds?: number[] };
+  };
+  bucketCounts?: string[];
+};
+
 type TimeSeriesPoint = {
   interval?: { startTime?: string; endTime?: string };
-  value?: { doubleValue?: number; int64Value?: string; boolValue?: boolean };
+  value?: {
+    doubleValue?: number;
+    int64Value?: string;
+    boolValue?: boolean;
+    distributionValue?: GcpDistribution;
+  };
 };
 
 export type GcpTimeSeries = {
@@ -160,26 +181,43 @@ export function gcpTimeSeriesToOtlp(series: GcpTimeSeries[], gcpProjectId: strin
     resourceMetrics: series.map((timeSeries) => {
       const resourceLabels = timeSeries.resource?.labels ?? {};
       const metricLabels = timeSeries.metric?.labels ?? {};
-      const dataPoints = (timeSeries.points ?? []).flatMap((point) => {
-        const value = pointValue(point.value);
-        if (!value || !point.interval?.endTime) return [];
-        return [
-          {
-            ...value,
-            timeUnixNano: timestampToNanos(point.interval.endTime),
-            ...(point.interval.startTime
-              ? { startTimeUnixNano: timestampToNanos(point.interval.startTime) }
-              : {}),
-            attributes: Object.entries(metricLabels).map(([key, item]) => ({
-              key: `gcp.metric.label.${key}`,
-              value: { stringValue: item },
-            })),
-          },
-        ];
-      });
+      const attributes = Object.entries(metricLabels).map(([key, item]) => ({
+        key: `gcp.metric.label.${key}`,
+        value: { stringValue: item },
+      }));
+      const isDistribution = timeSeries.valueType === "DISTRIBUTION";
+      const dataPoints = isDistribution
+        ? (timeSeries.points ?? []).flatMap((point) => {
+            if (!point.interval?.endTime) return [];
+            const distribution = histogramPoint(point.value?.distributionValue);
+            if (!distribution) return [];
+            return [
+              {
+                ...distribution,
+                ...pointMetadata(point, attributes),
+              },
+            ];
+          })
+        : (timeSeries.points ?? []).flatMap((point) => {
+            if (!point.interval?.endTime) return [];
+            const value = pointValue(point.value);
+            if (!value) return [];
+            return [
+              {
+                ...value,
+                ...pointMetadata(point, attributes),
+              },
+            ];
+          });
       const metricName = timeSeries.metric?.type ?? "gcp.unknown";
-      const data =
-        timeSeries.metricKind === "GAUGE"
+      const data = isDistribution
+        ? {
+            histogram: {
+              dataPoints,
+              aggregationTemporality: timeSeries.metricKind === "DELTA" ? 1 : 2,
+            },
+          }
+        : timeSeries.metricKind === "GAUGE"
           ? { gauge: { dataPoints } }
           : {
               sum: {
@@ -223,6 +261,77 @@ function pointValue(
   if (typeof value?.doubleValue === "number") return { asDouble: value.doubleValue };
   if (typeof value?.int64Value === "string") return { asInt: value.int64Value };
   if (typeof value?.boolValue === "boolean") return { asInt: value.boolValue ? "1" : "0" };
+  return null;
+}
+
+function pointMetadata(
+  point: TimeSeriesPoint,
+  attributes: Array<{ key: string; value: { stringValue: string } }>,
+) {
+  const endTime = point.interval?.endTime;
+  if (!endTime) throw new Error("GCP metric point is missing its end time");
+  return {
+    timeUnixNano: timestampToNanos(endTime),
+    ...(point.interval?.startTime
+      ? { startTimeUnixNano: timestampToNanos(point.interval.startTime) }
+      : {}),
+    attributes,
+  };
+}
+
+function histogramPoint(value: GcpDistribution | undefined) {
+  if (!value?.count || !value.bucketOptions || !value.bucketCounts) return null;
+  const explicitBounds = distributionBounds(value.bucketOptions);
+  if (!explicitBounds) return null;
+  const bucketCounts = [...value.bucketCounts];
+  while (bucketCounts.length < explicitBounds.length + 1) bucketCounts.push("0");
+  if (bucketCounts.length !== explicitBounds.length + 1) return null;
+  const count = Number(value.count);
+  const sum = typeof value.mean === "number" && Number.isFinite(count) ? value.mean * count : null;
+  return {
+    count: value.count,
+    ...(sum === null ? {} : { sum }),
+    ...(typeof value.range?.min === "number" ? { min: value.range.min } : {}),
+    ...(typeof value.range?.max === "number" ? { max: value.range.max } : {}),
+    bucketCounts,
+    explicitBounds,
+  };
+}
+
+function distributionBounds(
+  options: NonNullable<GcpDistribution["bucketOptions"]>,
+): number[] | null {
+  if (options?.explicitBuckets?.bounds) return options.explicitBuckets.bounds;
+  const linear = options?.linearBuckets;
+  const linearCount = linear?.numFiniteBuckets;
+  const linearWidth = linear?.width;
+  const linearOffset = linear?.offset;
+  if (
+    typeof linearCount === "number" &&
+    linearCount > 0 &&
+    typeof linearWidth === "number" &&
+    typeof linearOffset === "number"
+  ) {
+    return Array.from(
+      { length: linearCount + 1 },
+      (_, index) => linearOffset + linearWidth * index,
+    );
+  }
+  const exponential = options?.exponentialBuckets;
+  const exponentialCount = exponential?.numFiniteBuckets;
+  const growthFactor = exponential?.growthFactor;
+  const scale = exponential?.scale;
+  if (
+    typeof exponentialCount === "number" &&
+    exponentialCount > 0 &&
+    typeof growthFactor === "number" &&
+    typeof scale === "number"
+  ) {
+    return Array.from(
+      { length: exponentialCount + 1 },
+      (_, index) => scale * growthFactor ** index,
+    );
+  }
   return null;
 }
 

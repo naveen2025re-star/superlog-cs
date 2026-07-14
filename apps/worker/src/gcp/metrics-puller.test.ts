@@ -251,3 +251,109 @@ test("overlap reads do not forward metric points at or before the delivered curs
   );
   assert.equal(stats.pointsForwarded, 1);
 });
+
+test("Cloud Run CPU utilization distributions are forwarded as OTLP histograms", async () => {
+  const forwarded: unknown[] = [];
+  const savedCursors: Date[] = [];
+  let monitoringCalls = 0;
+  const stats = await runGcpMetricsPullOnce({
+    now: () => new Date("2026-07-13T12:00:00Z"),
+    monthlySeriesLimit: 100,
+    store: {
+      async listConnected() {
+        return [
+          {
+            id: "connection-id",
+            projectId: "project-id",
+            gcpProjectId: "acme-production",
+            metricsCursor: null,
+            metricsBudgetMonth: "2026-07",
+            metricsSeriesRead: 0,
+            ingestKey: "sl_public_test",
+          },
+        ];
+      },
+      async reserveBudget(_id, reservation) {
+        return reservation.requested;
+      },
+      async refundBudget() {},
+      async saveCursor(_id, cursor) {
+        savedCursors.push(cursor);
+      },
+    },
+    monitoring: {
+      async listTimeSeries() {
+        monitoringCalls += 1;
+        if (monitoringCalls > 1) return { timeSeries: [] };
+        return {
+          timeSeries: [
+            {
+              metric: { type: "run.googleapis.com/container/cpu/utilizations" },
+              resource: {
+                type: "cloud_run_revision",
+                labels: { service_name: "checkout-api" },
+              },
+              metricKind: "DELTA",
+              valueType: "DISTRIBUTION",
+              points: [
+                {
+                  interval: {
+                    startTime: "2026-07-13T11:58:00Z",
+                    endTime: "2026-07-13T11:59:00Z",
+                  },
+                  value: {
+                    distributionValue: {
+                      count: "4",
+                      mean: 0.5,
+                      range: { min: 0.2, max: 0.9 },
+                      bucketOptions: {
+                        exponentialBuckets: {
+                          numFiniteBuckets: 2,
+                          growthFactor: 2,
+                          scale: 0.25,
+                        },
+                      },
+                      bucketCounts: ["1", "1", "1", "1"],
+                    },
+                  },
+                },
+              ],
+            },
+          ],
+        };
+      },
+    },
+    async forward({ payload }) {
+      forwarded.push(payload);
+      return true;
+    },
+  });
+
+  const payload = forwarded[0] as {
+    resourceMetrics: Array<{
+      scopeMetrics: Array<{
+        metrics: Array<{
+          histogram: {
+            aggregationTemporality: number;
+            dataPoints: Array<Record<string, unknown>>;
+          };
+        }>;
+      }>;
+    }>;
+  };
+  const histogram = payload.resourceMetrics[0]?.scopeMetrics[0]?.metrics[0]?.histogram;
+  assert.equal(histogram?.aggregationTemporality, 1);
+  assert.deepEqual(histogram?.dataPoints[0], {
+    count: "4",
+    sum: 2,
+    min: 0.2,
+    max: 0.9,
+    bucketCounts: ["1", "1", "1", "1"],
+    explicitBounds: [0.25, 0.5, 1],
+    timeUnixNano: "1783943940000000000",
+    startTimeUnixNano: "1783943880000000000",
+    attributes: [],
+  });
+  assert.equal(stats.pointsForwarded, 1);
+  assert.deepEqual(savedCursors, [new Date("2026-07-13T12:00:00Z")]);
+});

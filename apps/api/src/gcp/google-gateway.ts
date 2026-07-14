@@ -373,6 +373,14 @@ export class GoogleGcpGateway implements GcpGateway {
   async deprovision(input: GcpDeprovisioningInput): Promise<void> {
     const serviceToken = await this.serviceAccessToken();
     const resourceSlug = `superlog-${input.connectionId}`;
+    // Remove the customer-owned sink first. If the temporary user no longer has
+    // access to that project, leave the integration-owned delivery resources in
+    // place so the currently connected path is not partially dismantled.
+    await deleteResource(
+      this.fetchImpl,
+      `https://logging.googleapis.com/v2/projects/${encodeURIComponent(input.gcpProjectId)}/sinks/${input.provisioned.logSinkName}`,
+      input.userAccessToken,
+    );
     const actions: Array<() => Promise<void>> = [
       () =>
         deleteResource(
@@ -380,12 +388,6 @@ export class GoogleGcpGateway implements GcpGateway {
           `https://pubsub.googleapis.com/v1/projects/${input.integrationProjectId}/subscriptions/${resourceSlug}`,
           serviceToken,
           input.integrationProjectId,
-        ),
-      () =>
-        deleteResource(
-          this.fetchImpl,
-          `https://logging.googleapis.com/v2/projects/${encodeURIComponent(input.gcpProjectId)}/sinks/${input.provisioned.logSinkName}`,
-          input.userAccessToken,
         ),
       () =>
         deleteResource(
