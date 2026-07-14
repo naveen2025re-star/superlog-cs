@@ -150,6 +150,15 @@ test("listSlackChannels returns the Slack error without paginating further", asy
   assert.equal(result.error, "token_revoked");
 });
 
+test("invalid Slack credentials revoke the stale installation", async () => {
+  const { isRevokedSlackAuthError } = await import("./slack.js");
+
+  for (const error of ["not_authed", "token_revoked", "invalid_auth", "account_inactive"]) {
+    assert.equal(isRevokedSlackAuthError(error), true, error);
+  }
+  assert.equal(isRevokedSlackAuthError("ratelimited"), false);
+});
+
 // Regression guard: clicking Send on the Slack incident feedback modal kept
 // surfacing "We had some trouble connecting. Try again?". Slack's
 // view_submission ack contract requires an EMPTY 200 body to close the modal;
@@ -214,6 +223,17 @@ test("listSlackChannels returns an error when the page cap is exhausted", async 
   assert.equal(result.ok, false);
   assert.ok(!result.ok);
   assert.equal(result.error, "pagination_limit_exceeded");
+});
+
+test("project Slack settings are exposed only through an authenticated project-scoped route", async () => {
+  const { Hono } = await import("hono");
+  const { mountSlackAuthed } = await import("./slack.js");
+  const app = new Hono();
+  mountSlackAuthed(app);
+
+  const res = await app.request("/api/projects/project-2/slack/installation");
+
+  assert.equal(res.status, 401);
 });
 
 test("chat anchors: top-level channel mention roots a thread at its own ts", async () => {
