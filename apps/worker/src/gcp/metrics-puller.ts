@@ -9,6 +9,8 @@ export const CURATED_GCP_METRIC_TYPES = [
   "pubsub.googleapis.com/subscription/num_undelivered_messages",
 ] as const;
 
+const GCP_METRICS_VISIBILITY_LAG_MS = 10 * 60 * 1000;
+
 type GcpDistribution = {
   count?: string;
   mean?: number;
@@ -163,7 +165,15 @@ export async function runGcpMetricsPullOnce(input: {
       }
       stats.pointsForwarded += points;
       const deliveredThrough = latestPointTime(fresh);
-      if (deliveredThrough) await input.store.saveCursor(connection.id, deliveredThrough);
+      if (deliveredThrough) {
+        // A faster metric must not advance the connection-wide cursor past
+        // points from a slower metric that are still within the overlap window.
+        const visibilityWatermark = endTime.getTime() - GCP_METRICS_VISIBILITY_LAG_MS;
+        await input.store.saveCursor(
+          connection.id,
+          new Date(Math.min(deliveredThrough.getTime(), visibilityWatermark)),
+        );
+      }
     } catch {
       stats.errors += 1;
     }

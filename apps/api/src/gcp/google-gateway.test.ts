@@ -124,6 +124,65 @@ test("provisioning keeps metered Pub/Sub resources and API quota in the integrat
   );
 });
 
+test("provisioning reconciles an existing subscription push configuration", async () => {
+  const requests: Array<{ url: URL; method: string; body: Record<string, unknown> }> = [];
+  const fetchImpl: typeof fetch = async (input, init = {}) => {
+    const url = new URL(
+      typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url,
+    );
+    const method = init.method ?? "GET";
+    const body = init.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+    requests.push({ url, method, body });
+    if (url.pathname === "/v3/projects/acme-production") {
+      return Response.json({ name: "projects/123456789012" });
+    }
+    if (url.pathname.endsWith(":getIamPolicy")) {
+      return Response.json({ bindings: [], etag: "etag" });
+    }
+    if (url.pathname.endsWith(":setIamPolicy")) return Response.json(body.policy ?? {});
+    if (url.pathname.endsWith("/sinks")) {
+      return Response.json({
+        name: "superlog-connection-id",
+        writerIdentity: "serviceAccount:cloud-logs@system.gserviceaccount.com",
+      });
+    }
+    if (url.pathname.includes("/subscriptions/") && method === "PUT") {
+      return Response.json({ error: { message: "already exists" } }, { status: 409 });
+    }
+    return Response.json({});
+  };
+  const gateway = new GoogleGcpGateway(config, fetchImpl, async () => "service-access-token");
+
+  await gateway.provision({
+    connectionId: "connection-id",
+    gcpProjectId: "acme-production",
+    userAccessToken: "temporary-user-token",
+    integrationProjectId: config.integrationProjectId,
+    readerServiceAccountEmail: config.readerServiceAccountEmail,
+    pushServiceAccountEmail: config.pushServiceAccountEmail,
+    pushAudience: "https://intake.example.com/new-audience",
+    pushEndpoint: "https://intake.example.com/new-endpoint/connection-id",
+  });
+
+  const patch = requests.find(
+    (request) => request.url.pathname.includes("/subscriptions/") && request.method === "PATCH",
+  );
+  assert.ok(patch);
+  assert.equal(patch.body.updateMask, "pushConfig,ackDeadlineSeconds,retryPolicy");
+  assert.deepEqual(patch.body.subscription, {
+    name: "projects/superlog-observability/subscriptions/superlog-connection-id",
+    ackDeadlineSeconds: 30,
+    pushConfig: {
+      pushEndpoint: "https://intake.example.com/new-endpoint/connection-id",
+      oidcToken: {
+        serviceAccountEmail: config.pushServiceAccountEmail,
+        audience: "https://intake.example.com/new-audience",
+      },
+    },
+    retryPolicy: { minimumBackoff: "10s", maximumBackoff: "600s" },
+  });
+});
+
 test("deprovisioning preserves a monitoring viewer grant that predates the connection", async () => {
   const requests: Array<{ url: URL; init: RequestInit; body: Record<string, unknown> }> = [];
   const readerMember = `serviceAccount:${config.readerServiceAccountEmail}`;

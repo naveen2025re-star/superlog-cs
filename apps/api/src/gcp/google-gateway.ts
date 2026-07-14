@@ -287,24 +287,46 @@ export class GoogleGcpGateway implements GcpGateway {
         projectPolicyChanged = true;
       }
 
-      await ensureResource(
-        this.fetchImpl,
-        `https://pubsub.googleapis.com/v1/${subscriptionPath}`,
-        serviceToken,
-        {
-          topic: topicPath,
-          ackDeadlineSeconds: 30,
-          pushConfig: {
-            pushEndpoint: input.pushEndpoint,
-            oidcToken: {
-              serviceAccountEmail: input.pushServiceAccountEmail,
-              audience: input.pushAudience,
-            },
+      const subscriptionUrl = `https://pubsub.googleapis.com/v1/${subscriptionPath}`;
+      const subscription = {
+        topic: topicPath,
+        ackDeadlineSeconds: 30,
+        pushConfig: {
+          pushEndpoint: input.pushEndpoint,
+          oidcToken: {
+            serviceAccountEmail: input.pushServiceAccountEmail,
+            audience: input.pushAudience,
           },
-          retryPolicy: { minimumBackoff: "10s", maximumBackoff: "600s" },
         },
+        retryPolicy: { minimumBackoff: "10s", maximumBackoff: "600s" },
+      };
+      const subscriptionCreated = await ensureResource(
+        this.fetchImpl,
+        subscriptionUrl,
+        serviceToken,
+        subscription,
         input.integrationProjectId,
       );
+      if (!subscriptionCreated) {
+        await requestJson(
+          this.fetchImpl,
+          subscriptionUrl,
+          serviceToken,
+          {
+            method: "PATCH",
+            body: JSON.stringify({
+              subscription: {
+                name: subscriptionPath,
+                ackDeadlineSeconds: subscription.ackDeadlineSeconds,
+                pushConfig: subscription.pushConfig,
+                retryPolicy: subscription.retryPolicy,
+              },
+              updateMask: "pushConfig,ackDeadlineSeconds,retryPolicy",
+            }),
+          },
+          input.integrationProjectId,
+        );
+      }
 
       return {
         gcpProjectNumber,

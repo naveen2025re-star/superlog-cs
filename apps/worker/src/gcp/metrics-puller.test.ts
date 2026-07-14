@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { runGcpMetricsPullOnce } from "./metrics-puller.js";
 
-test("the metrics puller spends only the remaining series budget and checkpoints after delivery", async () => {
+test("the metrics puller spends only the remaining budget and checkpoints at a visibility watermark", async () => {
   const pageSizes: number[] = [];
   const reservations: Array<{ month: string; requested: number; monthlyLimit: number }> = [];
   const savedCursors: Date[] = [];
@@ -82,7 +82,7 @@ test("the metrics puller spends only the remaining series budget and checkpoints
     { month: "2026-07", requested: 1_000, monthlyLimit: 100_000_000 },
   ]);
   assert.equal(seriesRead, 100_000_000);
-  assert.deepEqual(savedCursors, [new Date("2026-07-13T11:59:00Z")]);
+  assert.deepEqual(savedCursors, [new Date("2026-07-13T11:50:00Z")]);
   assert.deepEqual(stats, { connections: 1, seriesRead: 1, pointsForwarded: 1, errors: 0 });
 });
 
@@ -441,5 +441,5 @@ test("Cloud Run CPU utilization distributions are forwarded as OTLP histograms",
     attributes: [],
   });
   assert.equal(stats.pointsForwarded, 1);
-  assert.deepEqual(savedCursors, [new Date("2026-07-13T11:59:00Z")]);
+  assert.deepEqual(savedCursors, [new Date("2026-07-13T11:50:00Z")]);
 });
