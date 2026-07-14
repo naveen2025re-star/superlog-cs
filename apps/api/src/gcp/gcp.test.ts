@@ -7,7 +7,12 @@ import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { projectHasIngested } from "../demo.js";
 import type { GcpGateway } from "./domain.js";
-import { type GcpConnectConfig, mountGcpAuthed, mountGcpPublic } from "./interfaces.js";
+import {
+  type GcpConnectConfig,
+  gcpConfigFromEnv,
+  mountGcpAuthed,
+  mountGcpPublic,
+} from "./interfaces.js";
 import { DrizzleGcpConnectionRepository } from "./repository.js";
 
 process.env.STATE_SIGNING_SECRET ||= "gcp-test-state-secret";
@@ -27,6 +32,21 @@ const config: GcpConnectConfig = {
 
 const orgIds: string[] = [];
 const userIds: string[] = [];
+
+test("GCP config requires the secrets key before starting OAuth", () => {
+  const env = {
+    GCP_OAUTH_CLIENT_ID: "google-client-id",
+    GCP_OAUTH_CLIENT_SECRET: "google-client-secret",
+    GCP_OAUTH_REDIRECT_URI: "https://api.example.com/gcp/oauth/callback",
+    GCP_INTEGRATION_PROJECT_ID: "superlog-observability",
+    GCP_READER_SERVICE_ACCOUNT_EMAIL: "reader@example.iam.gserviceaccount.com",
+    GCP_PUBSUB_PUSH_SERVICE_ACCOUNT_EMAIL: "push@example.iam.gserviceaccount.com",
+    GCP_PUBSUB_PUSH_ENDPOINT: "https://intake.example.com/gcp/pubsub",
+  } as NodeJS.ProcessEnv;
+
+  assert.equal(gcpConfigFromEnv(env), null);
+  assert.ok(gcpConfigFromEnv({ ...env, AGENT_SECRETS_KEY: "encryption-key" }));
+});
 
 before(async () => {
   await runMigrations();

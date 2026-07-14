@@ -42,7 +42,8 @@ export function gcpConfigFromEnv(env: NodeJS.ProcessEnv = process.env): GcpConne
     !readerServiceAccountEmail ||
     !pushServiceAccountEmail ||
     !pushEndpoint ||
-    !pushAudience
+    !pushAudience ||
+    !env.AGENT_SECRETS_KEY
   ) {
     return null;
   }
