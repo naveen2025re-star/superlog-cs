@@ -33,6 +33,9 @@ test("Pub/Sub acknowledges permanent ingest rejects but preserves retryable fail
 
   const retryable = new Response("collector unavailable", { status: 503 });
   assert.equal(acknowledgeGcpPubSubDelivery(retryable), retryable);
+
+  const throttled = new Response("collector throttled", { status: 429 });
+  assert.equal(acknowledgeGcpPubSubDelivery(throttled), throttled);
 });
 
 test("Pub/Sub push authentication requires the configured audience and service account", async () => {

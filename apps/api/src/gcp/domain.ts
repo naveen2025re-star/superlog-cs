@@ -72,6 +72,7 @@ export interface GcpConnectionRepository {
   prepareMonitoringGrantRemoval(input: {
     connectionId: string;
     gcpProjectId: string;
+    readerServiceAccountEmail: string;
     grantCreated: boolean;
   }): Promise<boolean>;
   markProvisioning(id: string): Promise<void>;

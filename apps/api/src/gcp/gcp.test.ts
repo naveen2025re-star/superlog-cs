@@ -379,6 +379,7 @@ test("preserving a shared monitoring grant transfers cleanup ownership", async (
   const shouldRemove = await new DrizzleGcpConnectionRepository().prepareMonitoringGrantRemoval({
     connectionId: owner.id,
     gcpProjectId: owner.gcpProjectId,
+    readerServiceAccountEmail: owner.readerServiceAccountEmail,
     grantCreated: true,
   });
 
@@ -387,6 +388,47 @@ test("preserving a shared monitoring grant transfers cleanup ownership", async (
     where: eq(schema.gcpConnections.id, remaining.id),
   });
   assert.equal(transferred?.monitoringViewerGrantCreated, true);
+});
+
+test("a monitoring grant is not transferred to a different reader principal", async () => {
+  const first = await seedProject();
+  const second = await seedProject();
+  const [owner] = await db
+    .insert(schema.gcpConnections)
+    .values({
+      projectId: first.project.id,
+      gcpProjectId: "rotated-reader-production",
+      readerServiceAccountEmail: "old-reader@example.iam.gserviceaccount.com",
+      createdBy: first.user.id,
+      status: "connected",
+      monitoringViewerGrantCreated: true,
+    })
+    .returning();
+  const [remaining] = await db
+    .insert(schema.gcpConnections)
+    .values({
+      projectId: second.project.id,
+      gcpProjectId: "rotated-reader-production",
+      readerServiceAccountEmail: "new-reader@example.iam.gserviceaccount.com",
+      createdBy: second.user.id,
+      status: "connected",
+      monitoringViewerGrantCreated: false,
+    })
+    .returning();
+  assert.ok(owner && remaining);
+
+  const shouldRemove = await new DrizzleGcpConnectionRepository().prepareMonitoringGrantRemoval({
+    connectionId: owner.id,
+    gcpProjectId: owner.gcpProjectId,
+    readerServiceAccountEmail: owner.readerServiceAccountEmail,
+    grantCreated: true,
+  });
+
+  assert.equal(shouldRemove, true);
+  const unrelated = await db.query.gcpConnections.findFirst({
+    where: eq(schema.gcpConnections.id, remaining.id),
+  });
+  assert.equal(unrelated?.monitoringViewerGrantCreated, false);
 });
 
 test("a failed reconnect does not hide an older working GCP connection", async () => {

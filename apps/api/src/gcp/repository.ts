@@ -58,6 +58,7 @@ export class DrizzleGcpConnectionRepository implements GcpConnectionRepository {
   async prepareMonitoringGrantRemoval(input: {
     connectionId: string;
     gcpProjectId: string;
+    readerServiceAccountEmail: string;
     grantCreated: boolean;
   }): Promise<boolean> {
     if (!input.grantCreated) return false;
@@ -68,6 +69,7 @@ export class DrizzleGcpConnectionRepository implements GcpConnectionRepository {
         .where(
           and(
             eq(schema.gcpConnections.gcpProjectId, input.gcpProjectId),
+            eq(schema.gcpConnections.readerServiceAccountEmail, input.readerServiceAccountEmail),
             ne(schema.gcpConnections.id, input.connectionId),
             eq(schema.gcpConnections.status, "connected"),
             isNull(schema.gcpConnections.revokedAt),
