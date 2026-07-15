@@ -8,12 +8,19 @@ import {
   type GithubDirEntry,
   MAX_REPO_INSTRUCTION_FILES,
   applyAgentPatch,
+  buildPullRequestDeliveryCommitMessage,
   collectRepoInstructionFiles,
+  commitMessageHasPullRequestDelivery,
+  findPullRequestDeliveryCommit,
   formatRetryBranchName,
   isGitPushBranchCollision,
   isMissingRemoteBranchFailure,
   isRetryableGitPushFailure,
+  loadGithubPullRequestProviderObservationWithToken,
+  openedAgentPullRequest,
+  recoverPullRequestDelivery,
   redactGitSecrets,
+  reopenGithubPullRequestWithToken,
 } from "./github-app.js";
 
 function makeDirLister(
@@ -29,6 +36,79 @@ function file(path: string): GithubDirEntry {
 function dir(path: string): GithubDirEntry {
   return { name: path.split("/").at(-1) ?? path, path, type: "dir" };
 }
+
+test("reopenGithubPullRequestWithToken reopens a pull request through the REST fallback", async () => {
+  const requests: Array<{ url: string; method: string; body: unknown }> = [];
+  const result = await reopenGithubPullRequestWithToken({
+    token: "test-token",
+    repoFullName: "acme/api",
+    prNumber: 42,
+    userAgent: "test",
+    fetchImpl: async (input, init) => {
+      requests.push({
+        url: String(input),
+        method: init?.method ?? "GET",
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      });
+      return new Response('{"updated_at":"2026-07-14T11:05:30.000Z"}', { status: 200 });
+    },
+  });
+
+  assert.deepEqual(result, {
+    ok: true,
+    providerUpdatedAt: new Date("2026-07-14T11:05:30.000Z"),
+  });
+  assert.deepEqual(requests, [
+    {
+      url: "https://api.github.com/repos/acme/api/pulls/42",
+      method: "PATCH",
+      body: { state: "open" },
+    },
+  ]);
+});
+
+test("loadGithubPullRequestProviderObservationWithToken reads authoritative merged state", async () => {
+  const requests: Array<{ url: string; method: string }> = [];
+  const observedAt = new Date("2026-07-14T11:07:00.000Z");
+  const observation = await loadGithubPullRequestProviderObservationWithToken({
+    token: "test-token",
+    repoFullName: "acme/api",
+    prNumber: 42,
+    observedAt,
+    userAgent: "test",
+    fetchImpl: async (input, init) => {
+      requests.push({ url: String(input), method: init?.method ?? "GET" });
+      return new Response(
+        JSON.stringify({
+          state: "closed",
+          merged: true,
+          updated_at: "2026-07-14T11:06:30Z",
+          closed_at: "2026-07-14T11:06:30Z",
+          merged_at: "2026-07-14T11:06:30Z",
+          merged_by: { login: "octocat", id: 7 },
+          title: "Fix the incident",
+          head: { sha: "abc123" },
+        }),
+        { status: 200 },
+      );
+    },
+  });
+
+  assert.deepEqual(requests, [
+    { url: "https://api.github.com/repos/acme/api/pulls/42", method: "GET" },
+  ]);
+  assert.deepEqual(observation, {
+    targetState: "merged",
+    observedAt,
+    providerUpdatedAt: new Date("2026-07-14T11:06:30Z"),
+    headSha: "abc123",
+    title: "Fix the incident",
+    mergedAt: new Date("2026-07-14T11:06:30Z"),
+    closedAt: new Date("2026-07-14T11:06:30Z"),
+    mergedByLogin: "octocat",
+    mergedByGithubId: 7,
+  });
+});
 
 test("collectRepoInstructionFiles finds root-level instruction files", async () => {
   const found = await collectRepoInstructionFiles(
@@ -172,6 +252,175 @@ test("formatRetryBranchName appends a bounded retry suffix", () => {
     "superlog/fix-refresh-token-retry-abcdef12",
   );
   assert.equal(formatRetryBranchName("superlog/fix", "bad chars!"), "superlog/fix-retry-bad-char");
+});
+
+test("a pull request delivery marker is opaque, exact, and preserves the resolved base", () => {
+  const message = buildPullRequestDeliveryCommitMessage(
+    "Fix API retries",
+    "d4e5f60718293a4b",
+    "release/2026-07",
+  );
+
+  assert.equal(
+    message,
+    "Fix API retries\n\nDelivery-Id: d4e5f60718293a4b\nDelivery-Base: release/2026-07",
+  );
+  assert.equal(commitMessageHasPullRequestDelivery(message, "d4e5f60718293a4b"), true);
+  assert.equal(commitMessageHasPullRequestDelivery(message, "d4e5f60718293a4"), false);
+});
+
+test("existing-branch recovery matches the exact delivery marker, not an id prefix", () => {
+  assert.deepEqual(
+    findPullRequestDeliveryCommit(
+      [
+        {
+          sha: "wrong",
+          message: "Fix API retries\n\nDelivery-Id: d4e5f60718293a4b-extra",
+        },
+        {
+          sha: "right",
+          message: "Fix API retries\n\nDelivery-Id: d4e5f60718293a4b",
+        },
+      ],
+      "d4e5f60718293a4b",
+    ),
+    { sha: "right", message: "Fix API retries\n\nDelivery-Id: d4e5f60718293a4b" },
+  );
+});
+
+test("delivery recovery finds a merged PR even after its branch was deleted", async () => {
+  const lookedUpBranches: string[] = [];
+  const recovered = await recoverPullRequestDelivery({
+    deliveryId: "d4e5f60718293a4b",
+    requestedBranch: "ash/fix-api",
+    lookup: {
+      async listPullRequests(branchName) {
+        lookedUpBranches.push(branchName);
+        return branchName === "ash/fix-api-retry-d4e5f607"
+          ? [
+              {
+                prUrl: "https://github.com/acme/api/pull/42",
+                prNumber: 42,
+                prNodeId: "PR_42",
+                headSha: "abc123",
+                branchName,
+                baseBranch: "main",
+                state: "closed",
+                mergedAt: "2026-07-14T12:00:00Z",
+                authorLogin: "octocat",
+                authorGithubId: 1,
+                authorAvatarUrl: null,
+              },
+            ]
+          : [];
+      },
+      async listPullRequestCommitMessages(prNumber) {
+        assert.equal(prNumber, 42);
+        return ["Fix API retries\n\nDelivery-Id: d4e5f60718293a4b"];
+      },
+      async getBranchHead() {
+        return null;
+      },
+    },
+  });
+
+  assert.deepEqual(lookedUpBranches, ["ash/fix-api", "ash/fix-api-retry-d4e5f607"]);
+  assert.equal(recovered?.kind, "pull_request");
+  if (recovered?.kind !== "pull_request") return;
+  assert.equal(recovered.pullRequest.prNumber, 42);
+  assert.equal(recovered.pullRequest.state, "closed");
+
+  const opened = openedAgentPullRequest(recovered.pullRequest);
+  assert.equal(opened.state, "merged");
+  assert.deepEqual(opened.mergedAt, new Date("2026-07-14T12:00:00Z"));
+});
+
+test("delivery recovery never adopts a closed unmerged pull request", async () => {
+  const recovered = await recoverPullRequestDelivery({
+    deliveryId: "d4e5f60718293a4b",
+    requestedBranch: "ash/fix-api",
+    lookup: {
+      async listPullRequests(branchName) {
+        return branchName === "ash/fix-api"
+          ? [
+              {
+                prUrl: "https://github.com/acme/api/pull/42",
+                prNumber: 42,
+                prNodeId: "PR_42",
+                headSha: "abc123",
+                branchName,
+                baseBranch: "main",
+                state: "closed",
+                mergedAt: null,
+                authorLogin: "octocat",
+                authorGithubId: 1,
+                authorAvatarUrl: null,
+              },
+            ]
+          : [];
+      },
+      async listPullRequestCommitMessages(prNumber) {
+        assert.equal(prNumber, 42);
+        return ["Fix API retries\n\nDelivery-Id: d4e5f60718293a4b"];
+      },
+      async getBranchHead() {
+        return null;
+      },
+    },
+  });
+
+  assert.equal(recovered, null);
+});
+
+test("delivery recovery resumes a pushed branch that has no PR yet", async () => {
+  const recovered = await recoverPullRequestDelivery({
+    deliveryId: "d4e5f60718293a4b",
+    requestedBranch: "ash/fix-api",
+    lookup: {
+      async listPullRequests() {
+        return [];
+      },
+      async listPullRequestCommitMessages() {
+        return [];
+      },
+      async getBranchHead(branchName) {
+        return branchName === "ash/fix-api"
+          ? {
+              headSha: "abc123",
+              commitMessage:
+                "Fix API retries\n\nDelivery-Id: d4e5f60718293a4b\nDelivery-Base: development",
+            }
+          : null;
+      },
+    },
+  });
+
+  assert.deepEqual(recovered, {
+    kind: "branch",
+    branchName: "ash/fix-api",
+    headSha: "abc123",
+    baseBranch: "development",
+  });
+});
+
+test("an occupied deterministic fallback without the delivery marker is not adopted", async () => {
+  const recovered = await recoverPullRequestDelivery({
+    deliveryId: "d4e5f60718293a4b",
+    requestedBranch: "ash/fix-api",
+    lookup: {
+      async listPullRequests() {
+        return [];
+      },
+      async listPullRequestCommitMessages() {
+        return [];
+      },
+      async getBranchHead() {
+        return { headSha: "someone-elses-sha", commitMessage: "Unrelated work" };
+      },
+    },
+  });
+
+  assert.equal(recovered, null);
 });
 
 test("isMissingRemoteBranchFailure detects clone failures for deleted base branches", () => {

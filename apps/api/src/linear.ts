@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import {
+  type ResolveIncidentInput,
   captureAgentPrLifecycleEvent,
   createIncidentFromLinearSession,
   createIncidentLifecycle,
@@ -23,7 +24,7 @@ import {
 import { and, desc, eq, isNull, ne, or } from "drizzle-orm";
 import type { Hono } from "hono";
 import type { Context } from "hono";
-import { closeAgentPullRequestOnGithub } from "./github.js";
+import { closeAgentPullRequestOnGithub, reopenAgentPullRequestOnGithub } from "./github.js";
 import { runResolvedIncidentSideEffectsForIncident } from "./incidents/resolution-side-effects.js";
 import { logger } from "./logger.js";
 import { resolveActiveOrgContext } from "./org-context.js";
@@ -623,6 +624,30 @@ async function linearIncidentUrl(incident: schema.Incident): Promise<string | nu
   return `${origin.replace(/\/$/, "")}/org/${encodeURIComponent(org.slug)}/project/${encodeURIComponent(project.slug)}/incidents/${encodeURIComponent(incident.id)}`;
 }
 
+export function linearTicketResolutionInput(
+  ticket: schema.AgentLinearTicket,
+): ResolveIncidentInput {
+  const identifier = ticket.ticketIdentifier ?? ticket.ticketId;
+  return {
+    incidentId: ticket.incidentId,
+    kind: "linear_ticket_completed",
+    reasonCode: "linear_ticket_completed",
+    reasonText: `Resolved because Linear ticket ${identifier} entered a completed state.`,
+    agentRunId: ticket.agentRunId,
+    // The ticket points back to the run for audit attribution, but its external
+    // completion is not that run actively resolving the Incident.
+    resolvingAgentRunId: null,
+    eventSummary: `Incident resolved because Linear ticket ${identifier} was completed.`,
+    eventDetail: {
+      agentLinearTicketId: ticket.id,
+      ticketId: ticket.ticketId,
+      ticketIdentifier: ticket.ticketIdentifier,
+      ticketUrl: ticket.url,
+    },
+    eventDedupeKey: `incident_resolved:linear_ticket:${ticket.id}`,
+  };
+}
+
 async function acceptCompletedLinearTicket(args: {
   ticket: schema.AgentLinearTicket;
   occurredAt: Date;
@@ -645,34 +670,31 @@ async function acceptCompletedLinearTicket(args: {
     });
   }
 
-  await incidentLifecycle.resolve({
-    incidentId: ticket.incidentId,
-    kind: "linear_ticket_completed",
-    reasonCode: "linear_ticket_completed",
-    reasonText: `Resolved because Linear ticket ${ticket.ticketIdentifier ?? ticket.ticketId} entered a completed state.`,
-    agentRunId: ticket.agentRunId,
-    eventSummary: `Incident resolved because Linear ticket ${ticket.ticketIdentifier ?? ticket.ticketId} was completed.`,
-    eventDetail: {
-      agentLinearTicketId: ticket.id,
-      ticketId: ticket.ticketId,
-      ticketIdentifier: ticket.ticketIdentifier,
-      ticketUrl: ticket.url,
-    },
-    eventDedupeKey: `incident_resolved:linear_ticket:${ticket.id}`,
-  });
+  const resolution = await incidentLifecycle.resolveWithProof(linearTicketResolutionInput(ticket));
   // These effects are idempotent and must be retried even if an earlier
   // webhook attempt already won the incident-resolution write.
-  await runResolvedIncidentSideEffectsForIncident({
-    incidentId: ticket.incidentId,
-    closePullRequest: (pr) =>
-      closeAgentPullRequestOnGithub({
-        installationId: pr.githubInstallationId,
-        fallbackInstallationIds: pr.fallbackGithubInstallationIds,
-        repoFullName: pr.repoFullName,
-        prNumber: pr.prNumber,
-        prNodeId: pr.prNodeId,
-      }),
-  });
+  if (resolution.resolutionProof) {
+    await runResolvedIncidentSideEffectsForIncident({
+      incidentId: ticket.incidentId,
+      resolutionProof: resolution.resolutionProof,
+      closePullRequest: (pr) =>
+        closeAgentPullRequestOnGithub({
+          installationId: pr.githubInstallationId,
+          fallbackInstallationIds: pr.fallbackGithubInstallationIds,
+          repoFullName: pr.repoFullName,
+          prNumber: pr.prNumber,
+          prNodeId: pr.prNodeId,
+        }),
+      reopenPullRequest: (pr) =>
+        reopenAgentPullRequestOnGithub({
+          installationId: pr.githubInstallationId,
+          fallbackInstallationIds: pr.fallbackGithubInstallationIds,
+          repoFullName: pr.repoFullName,
+          prNumber: pr.prNumber,
+          prNodeId: pr.prNodeId,
+        }),
+    });
+  }
 }
 
 function describeLinearEvent(payload: LinearWebhookPayload): {

@@ -1,14 +1,290 @@
 import "../agent-run.test-env.js";
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import type { schema } from "@superlog/db";
+import type { AgentRunContext } from "../agent-run-context.js";
 import {
   WALL_CLOCK_MULTIPLIER,
   agentRunErrorLogMeta,
+  awaitingEventsCompensationPresentation,
   awaitingEventsSlackMessage,
   awaitingHumanSecondsFromEvents,
   exceededWallClockBudget,
+  failAgentRun,
   isTransientError,
+  moveAgentRunToAwaitingHuman,
+  moveAgentRunToBlockedNoGithub,
+  publishAwaitingEventsUpdateIfCurrent,
 } from "./status.js";
+
+test("lost failure transition suppresses webhook and provider side effects", async () => {
+  const calls: string[] = [];
+  const transitioned = await failAgentRun(
+    makeStatusContext("running"),
+    "sync_failed",
+    "Investigation sync failed.",
+    undefined,
+    makeRejectedStatusDeps(calls, "fail"),
+  );
+
+  assert.equal(transitioned, false);
+  assert.deepEqual(calls, ["transition:fail"]);
+});
+
+test("lost awaiting-human transition suppresses webhook and provider side effects", async () => {
+  const calls: string[] = [];
+  const transitioned = await moveAgentRunToAwaitingHuman(
+    makeStatusContext("running"),
+    "Which repository should I inspect?",
+    "Repository selection needs input.",
+    undefined,
+    makeRejectedStatusDeps(calls, "pauseForHuman"),
+  );
+
+  assert.equal(transitioned, false);
+  assert.deepEqual(calls, ["transition:pauseForHuman"]);
+});
+
+test("lost GitHub-block transition suppresses webhook and Slack side effects", async () => {
+  const calls: string[] = [];
+  const transitioned = await moveAgentRunToBlockedNoGithub(
+    makeStatusContext("repo_discovery"),
+    "no_github_install",
+    "Investigation blocked: GitHub is not connected.",
+    makeRejectedStatusDeps(calls, "blockForGithub"),
+  );
+
+  assert.equal(transitioned, false);
+  assert.deepEqual(calls, ["transition:blockForGithub"]);
+});
+
+test("resolution after a winning status transition preserves the metering claim while suppressing stale publication", async (t) => {
+  const cases = [
+    {
+      name: "failure",
+      run: (calls: string[]) =>
+        failAgentRun(
+          makeStatusContext("running"),
+          "sync_failed",
+          "Investigation sync failed.",
+          undefined,
+          makeRejectedStatusDeps(calls, null, [false]),
+        ),
+      transition: "transition:fail",
+    },
+    {
+      name: "awaiting human",
+      run: (calls: string[]) =>
+        moveAgentRunToAwaitingHuman(
+          makeStatusContext("running"),
+          "Which repository should I inspect?",
+          "Repository selection needs input.",
+          undefined,
+          makeRejectedStatusDeps(calls, null, [false]),
+        ),
+      transition: "transition:pauseForHuman",
+    },
+    {
+      name: "GitHub block",
+      run: (calls: string[]) =>
+        moveAgentRunToBlockedNoGithub(
+          makeStatusContext("repo_discovery"),
+          "no_github_install",
+          "Investigation blocked: GitHub is not connected.",
+          makeRejectedStatusDeps(calls, null, [false]),
+        ),
+      transition: "transition:blockForGithub",
+    },
+  ];
+
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      const calls: string[] = [];
+      assert.equal(await entry.run(calls), true);
+      assert.deepEqual(calls, [entry.transition, "ownership"]);
+    });
+  }
+});
+
+test("resolution during a status publication compensates the final provider state", async () => {
+  const calls: string[] = [];
+
+  assert.equal(
+    await failAgentRun(
+      makeStatusContext("running"),
+      "sync_failed",
+      "Investigation sync failed.",
+      undefined,
+      makeRejectedStatusDeps(calls, null, [true, false]),
+    ),
+    true,
+  );
+  assert.equal(calls.filter((call) => call === "ownership").length, 2);
+  assert.ok(calls.includes("reconcile"));
+});
+
+function makeRejectedStatusDeps(
+  calls: string[],
+  rejectedTransition: "fail" | "pauseForHuman" | "blockForGithub" | null,
+  ownership: boolean[] = [true, true],
+) {
+  const sideEffect = (name: string) => {
+    calls.push(`side-effect:${name}`);
+  };
+  return {
+    lifecycle: {
+      async fail() {
+        calls.push("transition:fail");
+        return rejectedTransition !== "fail";
+      },
+      async pauseForHuman() {
+        calls.push("transition:pauseForHuman");
+        return rejectedTransition !== "pauseForHuman";
+      },
+      async blockForGithub() {
+        calls.push("transition:blockForGithub");
+        return rejectedTransition !== "blockForGithub";
+      },
+      async canPublishStatusUpdate() {
+        calls.push("ownership");
+        return ownership.shift() ?? false;
+      },
+    },
+    enqueueAgentRunFailed: async () => {
+      sideEffect("enqueueAgentRunFailed");
+      return 1;
+    },
+    enqueueAgentRunAwaitingInput: async () => {
+      sideEffect("enqueueAgentRunAwaitingInput");
+      return 1;
+    },
+    postIncidentThreadMessage: async () => sideEffect("postIncidentThreadMessage"),
+    postLinearIncidentError: async () => sideEffect("postLinearIncidentError"),
+    postLinearIncidentElicitation: async () => sideEffect("postLinearIncidentElicitation"),
+    updateIncidentMainMessage: async () => sideEffect("updateIncidentMainMessage"),
+    applyIncidentMetadata: async () => sideEffect("applyIncidentMetadata"),
+    reconcileStalePublication: async () => {
+      calls.push("reconcile");
+    },
+    logError: () => sideEffect("logError"),
+  };
+}
+
+function makeStatusContext(state: schema.AgentRun["state"]): AgentRunContext {
+  return {
+    agentRun: {
+      id: "run-status-race",
+      state,
+      cumulativeRuntimeMinutes: 1,
+      resumeCount: 0,
+    } as schema.AgentRun,
+    incident: {
+      id: "incident-status-race",
+      title: "Status race",
+      service: "api",
+    } as schema.Incident,
+    project: {
+      id: "project-status-race",
+      orgId: "org-status-race",
+      name: "Status project",
+      slug: "status-project",
+    } as schema.Project,
+    org: { id: "org-status-race", slug: "status-org" } as schema.Org,
+  } as AgentRunContext;
+}
+
+test("an open incident resumed during waiting publication compensates to running provider state", () => {
+  assert.deepEqual(
+    awaitingEventsCompensationPresentation({
+      incidentStatus: "open",
+      agentRunState: "running",
+    }),
+    {
+      emoji: "arrow_forward",
+      label: "Investigation resumed",
+      summary: "Investigation resumed while the previous waiting update was publishing.",
+    },
+  );
+});
+
+test("a successor waiting on PR review replaces a stale completion publication", () => {
+  assert.deepEqual(
+    awaitingEventsCompensationPresentation({
+      incidentStatus: "open",
+      agentRunState: "awaiting_events",
+      agentRunResult: {
+        state: "awaiting_events",
+        summary: "Opened two fixes.",
+      },
+    }),
+    {
+      emoji: "hourglass_flowing_sand",
+      label: "Waiting on PR review",
+      summary: "Waiting on PR review while the previous waiting update was publishing.",
+    },
+  );
+});
+
+test("resolution immediately after parking suppresses waiting provider updates", async () => {
+  let published = 0;
+  let reconciled = 0;
+
+  const outcome = await publishAwaitingEventsUpdateIfCurrent({
+    isCurrent: async () => false,
+    publish: async () => {
+      published += 1;
+    },
+    reconcileStalePublication: async () => {
+      reconciled += 1;
+    },
+  });
+
+  assert.equal(outcome, "skipped");
+  assert.equal(published, 0);
+  assert.equal(reconciled, 0);
+});
+
+test("resolution during waiting publication compensates the stale provider state", async () => {
+  const ownership = [true, false];
+  let published = 0;
+  let reconciled = 0;
+
+  const outcome = await publishAwaitingEventsUpdateIfCurrent({
+    isCurrent: async () => ownership.shift() ?? false,
+    publish: async () => {
+      published += 1;
+    },
+    reconcileStalePublication: async () => {
+      reconciled += 1;
+    },
+  });
+
+  assert.equal(outcome, "reconciled");
+  assert.equal(published, 1);
+  assert.equal(reconciled, 1);
+});
+
+test("resume after the eligibility check replaces the waiting provider state", async () => {
+  const ownership = [true, false];
+  let providerLabel = "Waiting on PR review";
+
+  const outcome = await publishAwaitingEventsUpdateIfCurrent({
+    isCurrent: async () => ownership.shift() ?? false,
+    publish: async () => {
+      providerLabel = "Waiting on PR review";
+    },
+    reconcileStalePublication: async () => {
+      providerLabel =
+        awaitingEventsCompensationPresentation({
+          incidentStatus: "open",
+          agentRunState: "running",
+        })?.label ?? providerLabel;
+    },
+  });
+
+  assert.equal(outcome, "reconciled");
+  assert.equal(providerLabel, "Investigation resumed");
+});
 
 test("awaiting PR review Slack copy includes PRs and the Linear ticket", () => {
   assert.equal(
@@ -17,6 +293,18 @@ test("awaiting PR review Slack copy includes PRs and the Linear ticket", () => {
       url: "https://linear.app/acme/issue/ENG-42",
     }),
     ":hourglass_flowing_sand: Investigation is waiting on PR review. Open PRs: https://github.com/acme/api/pull/10 Linear ticket: ENG-42 (https://linear.app/acme/issue/ENG-42)",
+  );
+});
+
+test("external-cause waiting copy names the source and next step without claiming resolution", () => {
+  assert.equal(
+    awaitingEventsSlackMessage([], null, {
+      cause: "The provider account has no remaining credit.",
+      source: "Recall.ai",
+      evidence: "Bot creation returned HTTP 402 insufficient credit.",
+      recommendedNextStep: "Top up the account before retrying bot creation.",
+    }),
+    ":warning: Investigation found an external cause in Recall.ai and remains open. The provider account has no remaining credit. Next step: Top up the account before retrying bot creation.",
   );
 });
 

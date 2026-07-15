@@ -4,6 +4,7 @@ import { createClient } from "@clickhouse/client";
 import { serve } from "@hono/node-server";
 import { SpanStatusCode, trace } from "@opentelemetry/api";
 import {
+  INTERNAL_INCIDENT_EVENT_KIND_SQL_PATTERN,
   ISSUE_STATUSES,
   type Issue,
   buildIssueReopenPatch,
@@ -16,9 +17,11 @@ import {
   isAgentRunProvider,
   listAccessibleGithubInstallsForProject,
   mintApiKey,
+  queueAgentPullRequestRetry,
   recordInboundInteraction,
   resolveDefaultAgentRunProvider,
-  resolveIncident,
+  resolveIncidentWithProof,
+  restartAgentRun,
   runMigrations,
   schema,
   sendLoopsWelcomeFlow,
@@ -26,7 +29,19 @@ import {
 } from "@superlog/db";
 import { fingerprint, fingerprintLog } from "@superlog/fingerprint";
 import { Autumn, AutumnError } from "autumn-js";
-import { and, asc, count, desc, eq, inArray, isNotNull, isNull, ne, or } from "drizzle-orm";
+import {
+  and,
+  asc,
+  count,
+  desc,
+  eq,
+  inArray,
+  isNotNull,
+  isNull,
+  ne,
+  notLike,
+  or,
+} from "drizzle-orm";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { cors } from "hono/cors";
@@ -47,6 +62,7 @@ import {
 } from "./demo.js";
 import { mountFeedbackAuthed, mountFeedbackPublic } from "./feedback.js";
 import { type GatewayVars, mountGateway } from "./gateway.js";
+import { mountGcpAuthed, mountGcpPublic } from "./gcp/interfaces.js";
 import { prBaseBranchExists } from "./github-branches.js";
 import {
   closeAgentPullRequestOnGithub,
@@ -55,6 +71,7 @@ import {
   mountGithubAuthed,
   mountGithubAuthorOAuth,
   mountGithubPublic,
+  reopenAgentPullRequestOnGithub,
 } from "./github.js";
 import { createApiHttpObservabilityMiddleware } from "./http-observability.js";
 import { mountImpersonation } from "./impersonation.js";
@@ -117,7 +134,6 @@ import {
 } from "./project-mcp-servers.js";
 import { mountProjectRouteContext } from "./project-route-context.js";
 import { mountRailwayAuthed, mountRailwayPublic } from "./railway.js";
-import { mountGcpAuthed, mountGcpPublic } from "./gcp/interfaces.js";
 import { mountRenderAuthed } from "./render.js";
 import { mountSettingsAuthed } from "./settings.js";
 import { normalizeSignupIntentKeyHash, normalizeSignupIntentKeyPrefix } from "./signup-intents.js";
@@ -1269,14 +1285,14 @@ app.get("/api/projects/:projectId/issues", async (c) => {
   // silenced) so existing clients keep working.
   const statusParam = c.req.query("status");
   const silencedParam = c.req.query("silenced") ?? "active";
-  let where = projectFilter;
+  let where: ReturnType<typeof and> = projectFilter;
   if (statusParam && statusParam !== "all") {
     if (!(ISSUE_STATUSES as readonly string[]).includes(statusParam)) {
       throw new HTTPException(400, {
         message: `status must be one of ${ISSUE_STATUSES.join(", ")}, or 'all'`,
       });
     }
-    where = and(projectFilter, eq(schema.issues.status, statusParam as schema.IssueStatus))!;
+    where = and(projectFilter, eq(schema.issues.status, statusParam as schema.IssueStatus));
   } else if (!statusParam && silencedParam !== "all") {
     // Legacy "active" maps to statuses needing attention. Resolved issues are
     // excluded — before issue statuses existed, "active" meant "not silenced"
@@ -1284,8 +1300,8 @@ app.get("/api/projects/:projectId/issues", async (c) => {
     // problem-resolved issue in the Active tab forever.
     where =
       silencedParam === "silenced"
-        ? and(projectFilter, eq(schema.issues.status, "silenced"))!
-        : and(projectFilter, inArray(schema.issues.status, ["open", "under_observation"]))!;
+        ? and(projectFilter, eq(schema.issues.status, "silenced"))
+        : and(projectFilter, inArray(schema.issues.status, ["open", "under_observation"]));
   }
   const rows = await db.query.issues.findMany({
     where,
@@ -1427,7 +1443,7 @@ app.patch("/api/projects/:projectId/incidents/:incidentId", async (c) => {
   if (status === "resolved") {
     // Route the dashboard's mark-resolved through the shared helper so the
     // resolved_* columns are populated exactly like every other resolve path.
-    await resolveIncident({
+    const resolveResult = await resolveIncidentWithProof({
       incidentId,
       kind: "dashboard_manual",
       reasonCode: resolution,
@@ -1438,11 +1454,23 @@ app.patch("/api/projects/:projectId/incidents/:incidentId", async (c) => {
       resolvedByUserId: c.var.userId,
       issueOutcome: resolution === "not_an_issue" ? { kind: "silence" } : { kind: "resolve" },
     });
-    if (shouldRunResolvedIncidentSideEffects({ requestedStatus: status, incidentExists: true })) {
+    if (
+      resolveResult.resolutionProof &&
+      shouldRunResolvedIncidentSideEffects({ requestedStatus: status, incidentExists: true })
+    ) {
       await runResolvedIncidentSideEffectsForIncident({
         incidentId,
+        resolutionProof: resolveResult.resolutionProof,
         closePullRequest: (pr) =>
           closeAgentPullRequestOnGithub({
+            installationId: pr.githubInstallationId,
+            fallbackInstallationIds: pr.fallbackGithubInstallationIds,
+            repoFullName: pr.repoFullName,
+            prNumber: pr.prNumber,
+            prNodeId: pr.prNodeId,
+          }),
+        reopenPullRequest: (pr) =>
+          reopenAgentPullRequestOnGithub({
             installationId: pr.githubInstallationId,
             fallbackInstallationIds: pr.fallbackGithubInstallationIds,
             repoFullName: pr.repoFullName,
@@ -1521,11 +1549,20 @@ async function decideResolutionProposal(
     }
     throw new HTTPException(400, { message: result.reason ?? "decision failed" });
   }
-  if (decision === "confirm" && result.incidentId) {
+  if (decision === "confirm" && result.incidentId && result.resolutionProof) {
     await runResolvedIncidentSideEffectsForIncident({
       incidentId: result.incidentId,
+      resolutionProof: result.resolutionProof,
       closePullRequest: (pr) =>
         closeAgentPullRequestOnGithub({
+          installationId: pr.githubInstallationId,
+          fallbackInstallationIds: pr.fallbackGithubInstallationIds,
+          repoFullName: pr.repoFullName,
+          prNumber: pr.prNumber,
+          prNodeId: pr.prNodeId,
+        }),
+      reopenPullRequest: (pr) =>
+        reopenAgentPullRequestOnGithub({
           installationId: pr.githubInstallationId,
           fallbackInstallationIds: pr.fallbackGithubInstallationIds,
           repoFullName: pr.repoFullName,
@@ -2218,54 +2255,51 @@ app.get("/api/projects/:projectId/incidents/:incidentId/pull-requests", async (c
 // via `propose_pr` never record a patch body on the run result, so this is the
 // dashboard's only path to the diff — and it stays current with follow-up
 // commits pushed to the PR branch.
-app.get(
-  "/api/projects/:projectId/incidents/:incidentId/pull-requests/:prId/diff",
-  async (c) => {
-    const projectId = await requireProjectAccess(c, c.req.param("projectId"));
-    const incidentId = c.req.param("incidentId");
-    const prId = c.req.param("prId");
+app.get("/api/projects/:projectId/incidents/:incidentId/pull-requests/:prId/diff", async (c) => {
+  const projectId = await requireProjectAccess(c, c.req.param("projectId"));
+  const incidentId = c.req.param("incidentId");
+  const prId = c.req.param("prId");
 
-    const incident = await getProjectIncident(projectId, incidentId);
-    if (!incident) throw new HTTPException(404, { message: "incident not found" });
+  const incident = await getProjectIncident(projectId, incidentId);
+  if (!incident) throw new HTTPException(404, { message: "incident not found" });
 
-    const pr = await db.query.agentPullRequests.findFirst({
-      where: and(
-        eq(schema.agentPullRequests.id, prId),
-        eq(schema.agentPullRequests.incidentId, incidentId),
-      ),
+  const pr = await db.query.agentPullRequests.findFirst({
+    where: and(
+      eq(schema.agentPullRequests.id, prId),
+      eq(schema.agentPullRequests.incidentId, incidentId),
+    ),
+  });
+  if (!pr) throw new HTTPException(404, { message: "pull request not found" });
+
+  const installation = await db.query.githubInstallations.findFirst({
+    where: eq(schema.githubInstallations.id, pr.installationId),
+  });
+  if (!installation || installation.revokedAt) {
+    throw new HTTPException(409, { message: "github installation is unavailable" });
+  }
+
+  let patch: string;
+  try {
+    patch = await fetchGithubPullRequestDiff({
+      installationId: installation.installationId,
+      repoFullName: pr.repoFullName,
+      prNumber: pr.prNumber,
     });
-    if (!pr) throw new HTTPException(404, { message: "pull request not found" });
+  } catch (err) {
+    logger.warn(
+      {
+        scope: "incidents.pr_diff",
+        incident_id: incidentId,
+        pr_id: prId,
+        err: err instanceof Error ? err.message : String(err),
+      },
+      "failed to fetch PR diff from github",
+    );
+    throw new HTTPException(502, { message: "could not fetch the diff from github" });
+  }
 
-    const installation = await db.query.githubInstallations.findFirst({
-      where: eq(schema.githubInstallations.id, pr.installationId),
-    });
-    if (!installation || installation.revokedAt) {
-      throw new HTTPException(409, { message: "github installation is unavailable" });
-    }
-
-    let patch: string;
-    try {
-      patch = await fetchGithubPullRequestDiff({
-        installationId: installation.installationId,
-        repoFullName: pr.repoFullName,
-        prNumber: pr.prNumber,
-      });
-    } catch (err) {
-      logger.warn(
-        {
-          scope: "incidents.pr_diff",
-          incident_id: incidentId,
-          pr_id: prId,
-          err: err instanceof Error ? err.message : String(err),
-        },
-        "failed to fetch PR diff from github",
-      );
-      throw new HTTPException(502, { message: "could not fetch the diff from github" });
-    }
-
-    return c.json({ patch });
-  },
-);
+  return c.json({ patch });
+});
 
 app.post("/api/projects/:projectId/incidents/:incidentId/pull-requests/:prId/merge", async (c) => {
   const projectId = c.req.param("projectId");
@@ -2810,75 +2844,23 @@ app.post("/api/projects/:projectId/incidents/:incidentId/agent-run/restart", asy
   const incident = await getProjectIncident(projectId, incidentId);
   if (!incident) throw new HTTPException(404, { message: "incident not found" });
 
-  const latest = await getLatestAgentRun(incident.id);
-  if (!latest) throw new HTTPException(404, { message: "agent run not found" });
-
   const automation = await getProjectAutomation(projectId);
   if (!automation.agentRunEnabled) {
     throw new HTTPException(400, { message: "incident agent_runs are disabled" });
   }
 
-  const activeStates = [
-    "queued",
-    "repo_discovery",
-    "running",
-    "awaiting_human",
-    "awaiting_events",
-    "resuming",
-    "pr_retry_queued",
-    "blocked_no_github",
-  ];
-  const now = new Date();
-  const agentRun = await db.transaction(async (tx) => {
-    const superseded = await tx
-      .update(schema.agentRuns)
-      .set({ state: "superseded", completedAt: now, updatedAt: now })
-      .where(
-        and(
-          eq(schema.agentRuns.incidentId, incident.id),
-          inArray(schema.agentRuns.state, activeStates),
-        ),
-      )
-      .returning({ id: schema.agentRuns.id });
-
-    if (superseded.length > 0) {
-      await tx.insert(schema.incidentEvents).values(
-        superseded.map((row) => ({
-          agentRunId: row.id,
-          kind: "agent_run_superseded",
-          summary: "Investigation superseded by a restart.",
-          dedupeKey: `superseded:${row.id}:${now.getTime()}`,
-          processedAt: now,
-        })),
-      );
-    }
-
-    const [created] = await tx
-      .insert(schema.agentRuns)
-      .values({
-        incidentId: incident.id,
-        runtime: automation.agentRunProvider,
-        state: "queued",
-      })
-      .returning();
-    if (!created) throw new Error("failed to restart agent run");
-
-    await tx.insert(schema.incidentEvents).values({
-      agentRunId: created.id,
-      kind: "agent_run_restarted",
-      summary: "Investigation restarted.",
-      detail: {
-        restartedFromAgentRunId: latest.id,
-        restartedFromState: latest.state,
-      },
-      dedupeKey: `restart:${created.id}`,
-      processedAt: now,
-    });
-
-    return created;
+  const restart = await restartAgentRun(db, {
+    incidentId: incident.id,
+    runtime: automation.agentRunProvider,
   });
+  if (restart.outcome === "no_prior_run") {
+    throw new HTTPException(404, { message: "agent run not found" });
+  }
+  if (restart.outcome === "incident_not_open") {
+    throw new HTTPException(409, { message: "incident is no longer open" });
+  }
 
-  return c.json(agentRun);
+  return c.json(restart.agentRun);
 });
 
 // Derive a concise incident title from the user's free-text brief.
@@ -2971,43 +2953,21 @@ app.post("/api/projects/:projectId/incidents/:incidentId/agent-run/retry-pr", as
     throw new HTTPException(400, { message: eligibility.reason });
   }
 
-  const now = new Date();
-  const agentRun = await db.transaction(async (tx) => {
-    const [updated] = await tx
-      .update(schema.agentRuns)
-      .set({
-        state: "pr_retry_queued",
-        failureReason: null,
-        completedAt: null,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(schema.agentRuns.id, latest.id),
-          eq(schema.agentRuns.state, "failed"),
-          eq(schema.agentRuns.failureReason, "pr_open_failed"),
-        ),
-      )
-      .returning();
-    if (!updated) throw new HTTPException(409, { message: "agent run is no longer retryable" });
-
-    await tx.insert(schema.incidentEvents).values({
-      agentRunId: updated.id,
-      kind: "agent_run_pr_retry_queued",
-      summary: "PR delivery retry queued.",
-      detail: {
-        retriedFromState: latest.state,
-        selectedRepoFullName: latest.result?.pr?.selectedRepoFullName ?? null,
-        branchName: latest.result?.pr?.branchName ?? null,
-      },
-      dedupeKey: `pr-retry:${updated.id}:${now.getTime()}`,
-      processedAt: now,
-    });
-
-    return updated;
+  const retry = await queueAgentPullRequestRetry(db, {
+    incidentId: incident.id,
+    agentRunId: latest.id,
   });
+  if (retry.outcome === "incident_not_open") {
+    throw new HTTPException(409, { message: "incident is no longer open" });
+  }
+  if (retry.outcome === "agent_run_not_latest") {
+    throw new HTTPException(409, { message: "agent run is no longer the latest investigation" });
+  }
+  if (retry.outcome === "agent_run_not_retryable") {
+    throw new HTTPException(409, { message: retry.reason });
+  }
 
-  return c.json(agentRun);
+  return c.json(retry.agentRun);
 });
 
 type TimelineEvent = {
@@ -3039,9 +2999,12 @@ async function loadIncidentTimeline(
     // resolves, sweep proposal confirmations, etc., don't have an
     // agent_run_id to anchor to).
     db.query.incidentEvents.findMany({
-      where: or(
-        eq(schema.incidentEvents.agentRunId, agentRunId),
-        eq(schema.incidentEvents.incidentId, incidentId),
+      where: and(
+        or(
+          eq(schema.incidentEvents.agentRunId, agentRunId),
+          eq(schema.incidentEvents.incidentId, incidentId),
+        ),
+        notLike(schema.incidentEvents.kind, INTERNAL_INCIDENT_EVENT_KIND_SQL_PATTERN),
       ),
       orderBy: [asc(schema.incidentEvents.createdAt)],
     }),

@@ -1,4 +1,4 @@
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { DB } from "./client.js";
 import * as schema from "./schema.js";
 
@@ -15,6 +15,23 @@ export type InsertIncidentEventInput = {
 };
 
 export type IncidentRepository = ReturnType<typeof createIncidentRepository>;
+
+export type LockedOpenIncident = schema.Incident;
+
+export type LinkableIssue = Pick<schema.Issue, "id" | "lastSeen" | "service">;
+
+async function lockIncidentsByIdInTx(tx: Tx, incidentIds: string[]): Promise<schema.Incident[]> {
+  const ids = [...new Set(incidentIds)].sort();
+  if (ids.length === 0) return [];
+  // A merge takes two Incident locks. Always acquire them in database ID
+  // order so opposing A→B / B→A attempts cannot deadlock each other.
+  return tx
+    .select()
+    .from(schema.incidents)
+    .where(inArray(schema.incidents.id, ids))
+    .orderBy(asc(schema.incidents.id))
+    .for("update");
+}
 
 export function createIncidentRepository(database: DB) {
   return {
@@ -41,12 +58,108 @@ export function createIncidentRepository(database: DB) {
         .where(eq(schema.incidents.id, incidentId));
     },
 
-    findLatestAgentRunIdInTx(tx: Tx, incidentId: string): Promise<{ id: string } | undefined> {
-      return tx.query.agentRuns.findFirst({
-        where: eq(schema.agentRuns.incidentId, incidentId),
-        orderBy: (agentRuns, { desc }) => [desc(agentRuns.createdAt)],
+    async lockOpenIncidentInTx(tx: Tx, incidentId: string): Promise<LockedOpenIncident | null> {
+      const incident = (await lockIncidentsByIdInTx(tx, [incidentId]))[0];
+      return incident?.status === "open" ? incident : null;
+    },
+
+    lockIncidentsInTx(tx: Tx, incidentIds: string[]): Promise<schema.Incident[]> {
+      return lockIncidentsByIdInTx(tx, incidentIds);
+    },
+
+    async linkIssueInTx(
+      tx: Tx,
+      incident: LockedOpenIncident,
+      issue: LinkableIssue,
+      updatedAt: Date,
+    ): Promise<boolean> {
+      const inserted = await tx
+        .insert(schema.incidentIssues)
+        .values({ incidentId: incident.id, issueId: issue.id })
+        .onConflictDoNothing()
+        .returning({ id: schema.incidentIssues.id });
+      if (!inserted[0]) return false;
+
+      await tx
+        .update(schema.incidents)
+        .set({
+          lastSeen: sql`GREATEST(${schema.incidents.lastSeen}, ${issue.lastSeen.toISOString()}::timestamptz)`,
+          issueCount: sql`${schema.incidents.issueCount} + 1`,
+          service: incident.service ?? issue.service,
+          updatedAt,
+        })
+        .where(eq(schema.incidents.id, incident.id));
+      return true;
+    },
+
+    async lockLatestAgentRunInTx(
+      tx: Tx,
+      incidentId: string,
+    ): Promise<Pick<schema.AgentRun, "id" | "state"> | null> {
+      const [run] = await tx
+        .select({ id: schema.agentRuns.id, state: schema.agentRuns.state })
+        .from(schema.agentRuns)
+        .where(eq(schema.agentRuns.incidentId, incidentId))
+        .orderBy(desc(schema.agentRuns.createdAt), desc(schema.agentRuns.id))
+        .limit(1)
+        .for("update");
+      return run ?? null;
+    },
+
+    listAgentPullRequestStatesInTx(
+      tx: Tx,
+      incidentId: string,
+    ): Promise<Array<{ state: schema.AgentPrState }>> {
+      return tx.query.agentPullRequests.findMany({
+        where: eq(schema.agentPullRequests.incidentId, incidentId),
+        columns: { state: true },
+      });
+    },
+
+    listOpenAgentPullRequestsInTx(
+      tx: Tx,
+      incidentId: string,
+    ): Promise<Array<Pick<schema.AgentPullRequest, "repoFullName" | "prNumber" | "url">>> {
+      return tx.query.agentPullRequests.findMany({
+        where: and(
+          eq(schema.agentPullRequests.incidentId, incidentId),
+          eq(schema.agentPullRequests.state, "open"),
+        ),
+        orderBy: [asc(schema.agentPullRequests.createdAt), asc(schema.agentPullRequests.id)],
+        columns: { repoFullName: true, prNumber: true, url: true },
+      });
+    },
+
+    async hasUnprocessedIncidentEventKindInTx(
+      tx: Tx,
+      incidentId: string,
+      kind: string,
+    ): Promise<boolean> {
+      const event = await tx.query.incidentEvents.findFirst({
+        where: and(
+          eq(schema.incidentEvents.incidentId, incidentId),
+          eq(schema.incidentEvents.kind, kind),
+          isNull(schema.incidentEvents.processedAt),
+        ),
         columns: { id: true },
       });
+      return event !== undefined;
+    },
+
+    async hasIncidentResolutionEventInTx(
+      tx: Tx,
+      incidentId: string,
+      dedupeKey: string,
+    ): Promise<boolean> {
+      const event = await tx.query.incidentEvents.findFirst({
+        where: and(
+          eq(schema.incidentEvents.incidentId, incidentId),
+          eq(schema.incidentEvents.kind, "incident_resolved"),
+          eq(schema.incidentEvents.dedupeKey, dedupeKey),
+        ),
+        columns: { id: true },
+      });
+      return event !== undefined;
     },
 
     async insertEventInTx(tx: Tx, opts: InsertIncidentEventInput): Promise<void> {
@@ -95,6 +208,70 @@ export function createIncidentRepository(database: DB) {
         .where(and(eq(schema.incidents.id, input.incidentId), eq(schema.incidents.status, "open")))
         .returning({ id: schema.incidents.id });
       return updated.length > 0;
+    },
+
+    async completeRunsSupersededByResolutionInTx(
+      tx: Tx,
+      incidentId: string,
+      completedAt: Date,
+      resolvingAgentRunId?: string | null,
+    ): Promise<void> {
+      const incidentRuns = await tx
+        .select({
+          id: schema.agentRuns.id,
+          state: schema.agentRuns.state,
+          result: schema.agentRuns.result,
+          providerSessionId: schema.agentRuns.providerSessionId,
+          providerSessionStatus: schema.agentRuns.providerSessionStatus,
+        })
+        .from(schema.agentRuns)
+        .where(eq(schema.agentRuns.incidentId, incidentId))
+        .for("update");
+
+      for (const run of incidentRuns) {
+        if (run.id === resolvingAgentRunId) continue;
+        const isActive = !["complete", "failed", "superseded"].includes(run.state);
+        if (!isActive) {
+          if (run.providerSessionId && run.providerSessionStatus !== "terminated") {
+            await tx
+              .update(schema.agentRuns)
+              .set({ providerSessionStatus: "termination_pending", updatedAt: completedAt })
+              .where(eq(schema.agentRuns.id, run.id));
+          }
+          continue;
+        }
+        const result: schema.AgentRunResult = run.result
+          ? { ...run.result, state: "complete" }
+          : {
+              state: "complete",
+              summary: "Incident resolved; no further investigation is needed.",
+            };
+        await tx
+          .update(schema.agentRuns)
+          .set({
+            state: "complete",
+            result,
+            completedAt,
+            updatedAt: completedAt,
+            ...(run.providerSessionId && run.providerSessionStatus !== "terminated"
+              ? { providerSessionStatus: "termination_pending" }
+              : {}),
+          })
+          .where(eq(schema.agentRuns.id, run.id));
+        await tx
+          .insert(schema.incidentEvents)
+          .values({
+            agentRunId: run.id,
+            incidentId,
+            kind: "agent_run_completed",
+            summary: result.summary,
+            detail: { reason: "incident_resolved" },
+            dedupeKey: `completed:${run.id}`,
+            processedAt: completedAt,
+            createdAt: completedAt,
+          })
+          .onConflictDoNothing();
+      }
     },
 
     listIncidentIssueLinksInTx(tx: Tx, incidentId: string): Promise<schema.IncidentIssue[]> {

@@ -1,6 +1,7 @@
 import type {
   AgentMemoryKind,
   AgentRunFollowUpInteraction,
+  AgentRunFollowUpPullRequest,
   AgentRunResult,
   AgentRunTrigger,
   PrPolicy,
@@ -96,6 +97,9 @@ export type AgentRunnerPredecessorIncident = {
 export type AgentRunnerFollowUp = {
   trigger: Exclude<AgentRunTrigger, "incident">;
   interactions: AgentRunFollowUpInteraction[];
+  // All currently-open PRs on the Incident, including PRs delivered by an
+  // earlier run in the same investigation.
+  pullRequests: AgentRunFollowUpPullRequest[];
   priorRun: {
     state: "complete" | "failed";
     summary: string;
@@ -146,6 +150,7 @@ export type AgentRunnerStartInput = {
 // report_findings call has been seen earlier in the current turn — the
 // executor's validation needs it for the findings-first gate.
 export type OutcomeActionCall = {
+  toolUseId: string;
   name: string;
   input: unknown;
   hasFindings: boolean;
@@ -155,7 +160,15 @@ export type OutcomeActionCall = {
 export type OutcomeActionExecution =
   // handled: the executor ran (or rejected) the action; ack `payload` back
   // into the session with is_error = !ok.
-  | { handled: true; ok: boolean; payload: Record<string, unknown> }
+  | {
+      handled: true;
+      deferAck?: false;
+      ok: boolean;
+      payload: Record<string, unknown>;
+    }
+  // The action may have mutated external state, but its durable receipt could
+  // not be confirmed. Leave the call pending so an exact replay can recover.
+  | { handled: true; deferAck: true }
   // Not an outcome action — the dispatch loop tries its other handlers.
   | { handled: false };
 
@@ -171,15 +184,35 @@ export type AgentRunnerSnapshot = {
     detail: Record<string, unknown> | null;
   }>;
   result: AgentRunResult | null;
-  // The current turn's accumulated outcome state even when no terminal tool
-  // has been called: merged findings plus successfully executed mid-run
-  // actions. sync.ts uses it to assemble the parked result when a turn
-  // legitimately ends without a terminal call (open PRs awaiting review).
+  // Compatibility state for durable turns created before propose_pr became
+  // terminal: merged findings plus their retained actions. sync.ts uses it to
+  // assemble the parked result after one of those turns delivers a PR.
   // Optional so runners without the outcome toolset are unaffected.
   pendingOutcome?: {
     findings: AgentRunFindings | null;
     actions: ExecutedAction[];
   };
+  // Present while a batched propose_pr has delivered at least one repository
+  // but still owes exact retries for the remaining repositories. Optional so
+  // runners without the outcome toolset remain source-compatible.
+  partialPullRequestDelivery?: {
+    delivered: Array<{
+      repoFullName: string;
+      branchName: string;
+      url: string | null;
+    }>;
+    pendingRepoFullNames: string[];
+  } | null;
+  // Present for every incomplete or safety-blocked PR delivery. Optional so
+  // runners without the outcome toolset remain source-compatible.
+  blockingPullRequestDelivery?: {
+    kind: "retry_required" | "incident_not_open" | "manual_reconciliation_required";
+    delivered: Array<{
+      repoFullName: string;
+      branchName: string;
+      url: string | null;
+    }>;
+  } | null;
   // Custom tools the runtime had no handler for. The collector ack's them
   // with an error result so the session can leave requires_action; sync.ts
   // then fails the run with `unknown_custom_tool` so we can audit them later.
@@ -231,6 +264,10 @@ export type AgentRunnerBackend = {
   name: string;
   maxRepoResources: number;
   start(input: AgentRunnerStartInput): Promise<{ sessionId: string }>;
+  // Release a session that is no longer reachable from an open Incident.
+  // Implementations must be idempotent: an already-absent provider session is
+  // success so a delete followed by a failed DB acknowledgement can retry.
+  terminate(sessionId: string): Promise<void>;
   // Chat sessions reuse collect(); creation and messaging differ (chat prompt
   // + reply tool instead of the investigation outcome toolset — resume/steer
   // wrap messages in investigation framing a chat must not inherit).
@@ -247,10 +284,9 @@ export type AgentRunnerBackend = {
     orgId: string;
     projectId: string;
     incidentId: string;
-    // Executes the agent's non-terminal outcome-action tools (propose_pr,
-    // issue classification) and guards resolve_incident. When absent (e.g. a
-    // caller without run context), the backend error-acks those calls so the
-    // session never deadlocks in requires_action.
+    // Delivers propose_pr and preflights resolve_incident before their terminal
+    // success acks. When absent (e.g. a caller without run context), the
+    // backend error-acks those calls so the session never deadlocks.
     executeOutcomeAction?: (call: OutcomeActionCall) => Promise<OutcomeActionExecution>;
   }): Promise<number>;
   // Serve a chat session's pending tool calls (memory tools + the reply

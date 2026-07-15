@@ -102,11 +102,13 @@ export type {
   NewAgentMemory,
   AgentRunTrigger,
   AgentRunFollowUpInteraction,
+  AgentRunFollowUpPullRequest,
   AgentRunTriggerDetail,
   AgentRunResult,
   AgentRunPr,
   AgentRunIssueClassification,
   AgentRunIncidentResolution,
+  AgentRunExternalCause,
   AgentRunLinearTicket,
   AgentRunMobileRegressionTest,
   AgentRunFailureReason,
@@ -186,7 +188,9 @@ export {
   evaluateFollowUpEligibility,
   decideInboundContinuation,
   recordInboundInteraction,
+  restartAgentRun,
   requestFollowUpAgentRun,
+  type RestartAgentRunResult,
   FOLLOW_UP_MAX_AGE_DAYS,
   MAX_FOLLOW_UP_RUNS,
   type FollowUpEligibilityInput,
@@ -196,6 +200,35 @@ export {
   type RecordInboundInteractionResult,
   type RequestFollowUpResult,
 } from "./agent-follow-up.js";
+export {
+  type GithubAccessUnblockTrigger,
+  unblockAgentRunsAfterGithubAccess,
+} from "./agent-run-unblock.js";
+export {
+  queueAgentPullRequestRetry,
+  type QueueAgentPullRequestRetryResult,
+} from "./agent-pr-retry.js";
+export { agentPullRequestRetryEligibility } from "./agent-pr-retry-domain.js";
+export {
+  applyAgentPullRequestState,
+  applyAgentPullRequestStateInTx,
+  type ApplyAgentPullRequestStateInput,
+  type ApplyAgentPullRequestStateResult,
+  type AgentPullRequestStateTx,
+} from "./agent-pr-state.js";
+export {
+  type AgentPullRequestProviderMutation,
+  type AgentPullRequestProviderObservation,
+  type AgentPullRequestProviderReconciliation,
+  type AgentPullRequestProviderState,
+  reconcileAgentPullRequestProviderObservation,
+} from "./agent-pr-provider-reconciliation.js";
+export {
+  areAllIncidentPullRequestsMerged,
+  buildAgentPullRequestLifecycleContinuation,
+  type AgentPullRequestLifecycleContinuation,
+  type AgentPullRequestLifecycleRecord,
+} from "./agent-pr-lifecycle-continuation.js";
 export {
   decideChatInbound,
   findChatByAnchor,
@@ -226,6 +259,11 @@ export {
   type AgentRunIncidentPatch,
 } from "./incident-state.js";
 export {
+  INTERNAL_INCIDENT_EVENT_KIND_PREFIX,
+  INTERNAL_INCIDENT_EVENT_KIND_SQL_PATTERN,
+  isVisibleIncidentEventKind,
+} from "./incident-event-visibility.js";
+export {
   buildIssueObservePatch,
   buildIssueReopenPatch,
   buildIssueResolvePatch,
@@ -241,27 +279,46 @@ export {
 export {
   classifyIncidentIssue,
   listUnclassifiedIncidentIssues,
+  synthesizeLegacyIncidentIssueOutcomes,
   type ClassifyIncidentIssueResult,
   type IssueClassificationAction,
+  type SynthesizeLegacyIncidentIssueOutcomesResult,
 } from "./issue-classification.js";
 export {
   confirmResolutionProposal,
   createIncidentLifecycle,
+  finalizeFulfilledAgentPullRequestBatches,
   dismissResolutionProposal,
   mergeIncidentsInTx,
+  resolveAgentIncident,
   resolveIncident,
+  resolveIncidentWithProof,
+  resolveIncidentIfAllAgentPullRequestsMerged,
+  reconcileAgentRunCompletedByResolution,
+  validateIncidentIssueOutcomes,
+  reserveAgentPullRequestBatch,
   type ApplyAgentRunResultOutcome,
   type IncidentLifecycle,
+  type LinkIssueToOpenIncidentResult,
   type ResolutionProposalActor,
+  type ResolutionProposalDecisionResult,
+  type ResolveAgentIncidentResult,
   type ResolveIncidentInput,
+  type ResolveIncidentAfterAgentPullRequestsMergedResult,
   type ResolveIncidentResult,
+  type ResolveIncidentWithProofResult,
   type ResolveIssueOutcome,
 } from "./resolve-incident.js";
 export {
   closeIncidentOpenPullRequestsAfterResolution,
+  isIncidentResolutionProofCurrent,
+  loadCurrentIncidentResolutionProof,
   type CloseIncidentOpenPullRequestsResult,
   type CloseIncidentPullRequest,
+  type CloseIncidentPullRequestResult,
   type IncidentOpenPullRequestToClose,
+  type IncidentPullRequestProviderObservation,
+  type IncidentResolutionProof,
 } from "./incident-pr-resolution.js";
 export { resolveIncidentOrg } from "./incident-org.js";
 export {

@@ -1,8 +1,18 @@
-import { type AgentRunResult, db, schema } from "@superlog/db";
+import {
+  type AgentPullRequestLifecycleContinuation,
+  type AgentPullRequestLifecycleRecord,
+  type AgentRunResult,
+  areAllIncidentPullRequestsMerged,
+  buildAgentPullRequestLifecycleContinuation,
+  db,
+  recordInboundInteraction,
+  resolveIncidentIfAllAgentPullRequestsMerged,
+  schema,
+} from "@superlog/db";
 import { and, asc, desc, eq, inArray, isNull } from "drizzle-orm";
 import { TERMINAL_OUTCOME_NUDGE_MARKER, assembleAgentRunResult } from "../agent-outcome-tools.js";
 import type { AgentRunContext } from "../agent-run-context.js";
-import { createAgentRunLifecycle } from "../agent-run.js";
+import { type PauseForEventsOutcome, createAgentRunLifecycle } from "../agent-run.js";
 import { type AgentRunOutcome, recordAgentRunCompletion } from "../ai-usage.js";
 import { investigationGate } from "../billing/investigation-gate.js";
 import { usageNotifier } from "../billing/usage-notifier-infra.js";
@@ -11,12 +21,21 @@ import { postIncidentThreadMessage } from "../infra/slack/incident-messages.js";
 import { type ResolvedIntegration, loadEnabledIntegrationsForOrg } from "../integrations.js";
 import { logger } from "../logger.js";
 import { completeWithIncidentResolution, completeWithoutPullRequest } from "./completion.js";
+import {
+  PULL_REQUEST_DELIVERY_EVENT_KIND,
+  pullRequestDeliveryUrlFromReceiptDetail,
+} from "./deliverable-records.js";
 import { scheduleLinearHandoff } from "./linear-handoff.js";
 import { tryMergeAfterAgentRun } from "./merge.js";
 import { hasRevylCreateTestIntegration, looksLikeMobileChange } from "./mobile-regression.js";
 import { createOutcomeActionExecutor } from "./outcome-actions.js";
 import { completeWithPullRequest, resolvePullRequestBaseBranch } from "./pr-delivery.js";
-import { applyIncidentMetadataFromResult } from "./result-metadata.js";
+import {
+  type DeliveredPullRequestRecord,
+  reconcileDeliveredPullRequests,
+  selectDeliveredPullRequestsForOutcome,
+} from "./pr-result-reconciliation.js";
+import { supersededSnapshotCompletionResult } from "./resolution-completion.js";
 import {
   awaitingHumanSecondsFromEvents,
   exceededWallClockBudget,
@@ -27,6 +46,68 @@ import {
 } from "./status.js";
 
 export { hasRevylCreateTestIntegration } from "./mobile-regression.js";
+
+export async function meterAgentRunCompletionIfClaimed(
+  claimed: boolean,
+  meter: () => Promise<void>,
+): Promise<boolean> {
+  if (!claimed) return false;
+  await meter();
+  return true;
+}
+
+export function shouldFailForRuntimeBudget(args: {
+  activeRuntimeMinutes: number;
+  maxRuntimeMinutes: number;
+  hasResult: boolean;
+}): boolean {
+  return !args.hasResult && args.activeRuntimeMinutes >= args.maxRuntimeMinutes;
+}
+
+export function planPullRequestAwaitingEvents<
+  PullRequest extends { state: schema.AgentPrState; url: string },
+>(
+  result: AgentRunResult,
+  deliveredPullRequests: PullRequest[],
+): {
+  shouldFail: boolean;
+  openPrUrls: string[];
+  settledPullRequests: PullRequest[];
+} {
+  const isExternalCause = result.waitReason === "external_cause";
+  const openPrUrls = deliveredPullRequests
+    .filter((pullRequest) => pullRequest.state === "open")
+    .map((pullRequest) => pullRequest.url);
+  return {
+    shouldFail: !isExternalCause && deliveredPullRequests.length === 0,
+    openPrUrls,
+    settledPullRequests: isExternalCause
+      ? []
+      : deliveredPullRequests.filter((pullRequest) => pullRequest.state !== "open"),
+  };
+}
+
+export type AwaitingEventsTransitionPlan =
+  | { kind: "parked" }
+  | { kind: "skip" }
+  | {
+      kind: "complete";
+      incidentStatus: schema.IncidentStatus | null;
+      result: AgentRunResult;
+    };
+
+export function planAwaitingEventsTransition(
+  result: AgentRunResult,
+  outcome: PauseForEventsOutcome,
+): AwaitingEventsTransitionPlan {
+  if (outcome.kind === "parked") return { kind: "parked" };
+  if (outcome.kind === "run_not_running") return { kind: "skip" };
+  return {
+    kind: "complete",
+    incidentStatus: outcome.incidentStatus,
+    result: { ...result, state: "complete" },
+  };
+}
 
 export function isCompleteInvestigationAllowed(
   result: AgentRunResult,
@@ -143,6 +224,104 @@ export async function steerIdleRunnerWithPendingContext(opts: {
   return "steered";
 }
 
+export type SettledPullRequestLifecycle = AgentPullRequestLifecycleRecord;
+
+export type SettledPullRequestContinuationOutcome =
+  | "steered"
+  | "busy"
+  | "deferred"
+  | "terminated"
+  | "unavailable"
+  | "not_applicable";
+
+export type PullRequestLifecycleRecordOutcome = "recorded" | "duplicate" | "unavailable";
+
+export type SettledPullRequestFallbackPlan =
+  | { kind: "resolve_merged"; pullRequest: SettledPullRequestLifecycle }
+  | { kind: "follow_up" };
+
+export function planSettledPullRequestFallback(
+  settledPullRequests: SettledPullRequestLifecycle[],
+  incidentPullRequests: SettledPullRequestLifecycle[],
+): SettledPullRequestFallbackPlan {
+  const mergedPullRequest = settledPullRequests.find(
+    (pullRequest) => pullRequest.state === "merged",
+  );
+  if (mergedPullRequest && areAllIncidentPullRequestsMerged(incidentPullRequests)) {
+    return { kind: "resolve_merged", pullRequest: mergedPullRequest };
+  }
+  return { kind: "follow_up" };
+}
+
+// A durable provider session can resume for several turns while retaining the
+// same AgentRun id. Delivery receipts recover a partial batch only within the
+// current turn: receipts older than the latest `resumed` event belong to an
+// earlier terminal outcome and must not pull its settled PR into this one.
+export function selectDeliveredPullRequestsForCurrentTurn<
+  PullRequest extends DeliveredPullRequestRecord,
+>(
+  result: AgentRunResult,
+  deliveredPullRequests: PullRequest[],
+  currentAgentRunId: string,
+  deliveryReceiptEvents: Array<{
+    detail: Record<string, unknown> | null;
+    createdAt: Date;
+  }>,
+  latestResumedAt: Date | null,
+): PullRequest[] {
+  const cutoff = latestResumedAt?.getTime() ?? Number.NEGATIVE_INFINITY;
+  const deliveryReceiptUrls = deliveryReceiptEvents.flatMap(({ detail, createdAt }) => {
+    if (createdAt.getTime() < cutoff) return [];
+    const url = pullRequestDeliveryUrlFromReceiptDetail(detail);
+    return url ? [url] : [];
+  });
+  return selectDeliveredPullRequestsForOutcome(result, deliveredPullRequests, currentAgentRunId, {
+    deliveryReceiptUrls,
+  });
+}
+
+export async function continueSettledPullRequestLifecycle(opts: {
+  snapshotStatus: string;
+  settledPullRequests: SettledPullRequestLifecycle[];
+  now: Date;
+  recordInteraction(
+    continuation: AgentPullRequestLifecycleContinuation,
+  ): Promise<PullRequestLifecycleRecordOutcome>;
+  loadPendingContextEvents(): Promise<PendingContextEvent[]>;
+  runner: { steer(sessionId: string, message: string): Promise<void> };
+  sessionId: string;
+  incidentId: string;
+  markEventsProcessed(ids: string[]): Promise<void>;
+  notifySteered(incidentId: string): Promise<void>;
+}): Promise<SettledPullRequestContinuationOutcome> {
+  const continuations = opts.settledPullRequests.flatMap((pullRequest) => {
+    const continuation = buildAgentPullRequestLifecycleContinuation({
+      pullRequest,
+      fallbackOccurredAt: opts.now,
+    });
+    return continuation ? [continuation] : [];
+  });
+  if (continuations.length === 0) return "not_applicable";
+  if (opts.snapshotStatus === "terminated") return "terminated";
+
+  const recordOutcomes: PullRequestLifecycleRecordOutcome[] = [];
+  for (const continuation of continuations) {
+    recordOutcomes.push(await opts.recordInteraction(continuation));
+  }
+  const pendingContextEvents = await opts.loadPendingContextEvents();
+  const steerOutcome = await steerIdleRunnerWithPendingContext({
+    snapshotStatus: opts.snapshotStatus,
+    pendingContextEvents,
+    runner: opts.runner,
+    sessionId: opts.sessionId,
+    incidentId: opts.incidentId,
+    markEventsProcessed: opts.markEventsProcessed,
+    notifySteered: opts.notifySteered,
+  });
+  if (steerOutcome !== "not_applicable") return steerOutcome;
+  return recordOutcomes.every((outcome) => outcome === "unavailable") ? "unavailable" : "deferred";
+}
+
 type MobileRegressionToolLookupState = "enabled" | "disabled" | "failed";
 type MobileRegressionGateState = "allow" | "repair" | "defer_lookup";
 
@@ -248,9 +427,32 @@ export function terminalOutcomeNudgePrompt(
   return [
     TERMINAL_OUTCOME_NUDGE_MARKER,
     args.completeInvestigationAvailable
-      ? "Call `report_findings` now, then explicitly end your turn with `complete_investigation`. Use `resolve_incident` only if impact has ceased and every linked issue is classified, or `ask_human` if a concrete human answer is required first."
-      : "Call `report_findings` now if you have findings to record, classify each linked issue (`silence_as_noise`, `place_under_observation`, or `resolve_issue`), open any needed PR with `propose_pr`, and then end your turn by calling `resolve_incident` — or `ask_human` if a human must act or answer first.",
+      ? "Call `report_findings` now, then explicitly end your turn with `complete_investigation`, `report_external_cause`, `resolve_incident` with all Issue outcomes, or `ask_human`."
+      : "Call `report_findings` now if you have findings to record, then end the turn with exactly one terminal tool: batched `propose_pr`, `resolve_incident` with all Issue outcomes, `report_external_cause`, or `ask_human`.",
   ].join("\n");
+}
+
+const PARTIAL_PULL_REQUEST_RETRY_NUDGE_MARKER = "[superlog:partial-pull-request-retry-nudge]";
+
+export function partialPullRequestRetryNudgePrompt(pendingRepoFullNames: string[]): string {
+  return [
+    TERMINAL_OUTCOME_NUDGE_MARKER,
+    `${PARTIAL_PULL_REQUEST_RETRY_NUDGE_MARKER} ${JSON.stringify(pendingRepoFullNames)}`,
+    `Retry \`propose_pr\` now with exactly these pending repositories: ${pendingRepoFullNames.join(
+      ", ",
+    )}. Do not repeat repositories that were already delivered.`,
+  ].join("\n");
+}
+
+export function shouldParkCompatibilityPullRequests(args: {
+  openPullRequestCount: number;
+  blockingPullRequestDeliveryKind:
+    | "retry_required"
+    | "incident_not_open"
+    | "manual_reconciliation_required"
+    | null;
+}): boolean {
+  return args.openPullRequestCount > 0 && args.blockingPullRequestDeliveryKind === null;
 }
 
 export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
@@ -297,7 +499,13 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
     }
 
     const nextRuntimeMinutes = Math.ceil(snapshot.activeSeconds / 60);
-    if (nextRuntimeMinutes >= ctx.automation.maxRuntimeMinutes) {
+    if (
+      shouldFailForRuntimeBudget({
+        activeRuntimeMinutes: nextRuntimeMinutes,
+        maxRuntimeMinutes: ctx.automation.maxRuntimeMinutes,
+        hasResult: snapshot.result !== null,
+      })
+    ) {
       await failAgentRun(
         ctx,
         "runtime_budget_exhausted",
@@ -344,11 +552,43 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
       return;
     }
 
+    // Emit AI-cost metering only after the paired DB state transition commits.
+    // A transient failure leaves the AgentRun in its current state, so a later
+    // tick can retry without double-counting cumulative provider usage.
+    const meterAgentRun = async (
+      outcome: AgentRunOutcome,
+      hasPr = outcome === "complete_with_pr",
+    ): Promise<void> => {
+      await recordAgentRunCompletion({
+        orgId: ctx.project.orgId,
+        projectId: ctx.project.id,
+        incidentId: ctx.incident.id,
+        model: snapshot.modelUsage.model,
+        callSite: "agent_run",
+        usage: snapshot.modelUsage,
+        activeSeconds: snapshot.activeSeconds,
+        outcome,
+        hasPr,
+      });
+      if (outcome === "complete_with_pr" || outcome === "complete_no_pr") {
+        await investigationGate.recordInvestigation(ctx.project.orgId);
+        void usageNotifier?.notify(ctx.project.orgId);
+      }
+    };
+    const reconcileTerminalSnapshotAfterResolution = (result: AgentRunResult) =>
+      agentRunLifecycle.reconcileCompletedByResolution({
+        id: ctx.agentRun.id,
+        result: supersededSnapshotCompletionResult(result),
+        cumulativeRuntimeMinutes: nextRuntimeMinutes,
+        lastSyncedAt: new Date(),
+      });
+
+    const syncedAt = new Date();
     const baseUpdate: Partial<schema.AgentRun> = {
       providerSessionStatus: snapshot.status,
       cumulativeRuntimeMinutes: nextRuntimeMinutes,
-      lastSyncedAt: new Date(),
-      updatedAt: new Date(),
+      lastSyncedAt: syncedAt,
+      updatedAt: syncedAt,
     };
 
     const selectedRepoFullName = snapshot.result?.pr?.selectedRepoFullName ?? null;
@@ -360,10 +600,31 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
     if (baseBranch) {
       baseUpdate.selectedBaseBranch = baseBranch;
     }
-    await db
-      .update(schema.agentRuns)
-      .set(baseUpdate)
-      .where(eq(schema.agentRuns.id, ctx.agentRun.id));
+    const snapshotRecorded = await agentRunLifecycle.recordCollectedSnapshotIfCurrent({
+      id: ctx.agentRun.id,
+      incidentId: ctx.incident.id,
+      currentState: ctx.agentRun.state,
+      updates: baseUpdate,
+    });
+    if (!snapshotRecorded) {
+      if (!snapshot.result) return;
+      const reconciled = await agentRunLifecycle.reconcileCompletedByResolution({
+        id: ctx.agentRun.id,
+        result: supersededSnapshotCompletionResult(snapshot.result),
+        cumulativeRuntimeMinutes: nextRuntimeMinutes,
+        lastSyncedAt: syncedAt,
+        selectedRepoFullName,
+        selectedBaseBranch: baseBranch,
+      });
+      if (reconciled) {
+        const hasPr = !!(await db.query.agentPullRequests.findFirst({
+          where: eq(schema.agentPullRequests.incidentId, ctx.incident.id),
+          columns: { id: true },
+        }));
+        await meterAgentRun(hasPr ? "complete_with_pr" : "complete_no_pr", hasPr);
+      }
+      return;
+    }
 
     if (
       shouldDeferSteering({
@@ -446,7 +707,7 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
         });
         if (gateState !== "allow") {
           if (snapshot.status === "terminated") {
-            await failAgentRun(
+            const failed = await failAgentRun(
               ctx,
               "terminated_without_result",
               mobileRegressionGateTerminatedSummary(gateState),
@@ -454,6 +715,11 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
                 existingResult: snapshot.result,
               },
             );
+            if (failed) {
+              await meterAgentRun("failed");
+            } else if (await reconcileTerminalSnapshotAfterResolution(snapshot.result)) {
+              await meterAgentRun("complete_no_pr");
+            }
             return;
           }
 
@@ -465,7 +731,7 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
               awaitingHumanSeconds,
             })
           ) {
-            await failAgentRun(
+            const failed = await failAgentRun(
               ctx,
               "wall_clock_timeout",
               mobileRegressionGateFailureSummary(gateState),
@@ -473,6 +739,11 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
                 existingResult: snapshot.result,
               },
             );
+            if (failed) {
+              await meterAgentRun("failed");
+            } else if (await reconcileTerminalSnapshotAfterResolution(snapshot.result)) {
+              await meterAgentRun("complete_no_pr");
+            }
             return;
           }
 
@@ -500,16 +771,6 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
         }
       }
 
-      const metadataChanged = await applyIncidentMetadataFromResult(ctx, snapshot.result);
-      if (metadataChanged) {
-        // Refresh ctx.incident so downstream Slack messages and PR titles use
-        // the renamed title / new severity rather than the stale snapshot.
-        const refreshed = await db.query.incidents.findFirst({
-          where: eq(schema.incidents.id, ctx.incident.id),
-        });
-        if (refreshed) ctx.incident = refreshed;
-      }
-
       if (selectedRepoFullName) {
         await agentRunLifecycle.appendRepoSelectedEvent({
           agentRunId: ctx.agentRun.id,
@@ -517,50 +778,285 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
         });
       }
 
-      // Helper for AI-cost metering. We emit ONLY after the paired DB state
-      // transition commits — a transient DB failure leaves the agentRun
-      // in its current state, the next tick re-enters this block with the
-      // same Anthropic snapshot, and we'd double-count cumulative counters.
-      const meterAgentRun = async (outcome: AgentRunOutcome): Promise<void> => {
-        await recordAgentRunCompletion({
-          orgId: ctx.project.orgId,
-          projectId: ctx.project.id,
-          incidentId: ctx.incident.id,
-          model: snapshot.modelUsage.model,
-          callSite: "agent_run",
-          usage: snapshot.modelUsage,
-          activeSeconds: snapshot.activeSeconds,
-          outcome,
-          hasPr: outcome === "complete_with_pr",
-        });
-        // Consume one investigation credit per COMPLETED run (the billable
-        // unit). Failed / awaiting_human runs don't burn a credit. Fail-open:
-        // recordInvestigation never throws (see investigation-gate.ts).
-        if (outcome === "complete_with_pr" || outcome === "complete_no_pr") {
-          await investigationGate.recordInvestigation(ctx.project.orgId);
-          // Re-check usage after consuming a credit so investigation 50/85/100%
-          // thresholds fire promptly. Fire-and-forget; the notifier dedupes.
-          void usageNotifier?.notify(ctx.project.orgId);
-        }
-      };
-
       if (snapshot.result.state === "awaiting_human") {
-        await moveAgentRunToAwaitingHuman(
+        const paused = await moveAgentRunToAwaitingHuman(
           ctx,
           snapshot.result.question ?? "Reply in this thread with the missing context.",
           snapshot.result.summary,
+          snapshot.result,
         );
-        await meterAgentRun("awaiting_human");
+        if (paused) {
+          await meterAgentRun("awaiting_human");
+        } else if (await reconcileTerminalSnapshotAfterResolution(snapshot.result)) {
+          await meterAgentRun("complete_no_pr");
+        }
         return;
       }
 
       if (snapshot.result.state === "failed") {
         const reason: schema.AgentRunFailureReason =
           snapshot.result.failureReason ?? "agent_no_findings";
-        await failAgentRun(ctx, reason, snapshot.result.summary, {
+        const failed = await failAgentRun(ctx, reason, snapshot.result.summary, {
           existingResult: snapshot.result,
         });
-        await meterAgentRun("failed");
+        if (failed) {
+          await meterAgentRun("failed");
+        } else if (await reconcileTerminalSnapshotAfterResolution(snapshot.result)) {
+          await meterAgentRun("complete_no_pr");
+        }
+        return;
+      }
+
+      if (snapshot.result.state === "awaiting_events") {
+        const [deliveredPrs, deliveryReceiptEvents, latestResumedEvent] = await Promise.all([
+          db.query.agentPullRequests.findMany({
+            where: eq(schema.agentPullRequests.incidentId, ctx.incident.id),
+            columns: {
+              id: true,
+              agentRunId: true,
+              repoFullName: true,
+              branchName: true,
+              baseBranch: true,
+              prNumber: true,
+              title: true,
+              url: true,
+              state: true,
+              mergedAt: true,
+              closedAt: true,
+              mergedByLogin: true,
+              createdAt: true,
+            },
+            orderBy: [asc(schema.agentPullRequests.createdAt), asc(schema.agentPullRequests.id)],
+          }),
+          db.query.incidentEvents.findMany({
+            where: and(
+              eq(schema.incidentEvents.incidentId, ctx.incident.id),
+              eq(schema.incidentEvents.agentRunId, ctx.agentRun.id),
+              eq(schema.incidentEvents.kind, PULL_REQUEST_DELIVERY_EVENT_KIND),
+            ),
+            columns: { detail: true, createdAt: true },
+          }),
+          db.query.incidentEvents.findFirst({
+            where: and(
+              eq(schema.incidentEvents.incidentId, ctx.incident.id),
+              eq(schema.incidentEvents.agentRunId, ctx.agentRun.id),
+              eq(schema.incidentEvents.kind, "resumed"),
+            ),
+            columns: { createdAt: true },
+            orderBy: [desc(schema.incidentEvents.createdAt), desc(schema.incidentEvents.id)],
+          }),
+        ]);
+        // A failed batch can deliver some repositories before the model
+        // retries only the remaining entries. The final tool result therefore
+        // does not necessarily name every mutation from this run. Durable
+        // per-delivery receipts retain those earlier URLs, including updates
+        // to canonical PR rows originally created by another run.
+        const outcomePrs = selectDeliveredPullRequestsForCurrentTurn(
+          snapshot.result,
+          deliveredPrs,
+          ctx.agentRun.id,
+          deliveryReceiptEvents,
+          latestResumedEvent?.createdAt ?? null,
+        );
+        const waitPlan = planPullRequestAwaitingEvents(snapshot.result, outcomePrs);
+        if (waitPlan.shouldFail) {
+          const failed = await failAgentRun(
+            ctx,
+            "sync_failed",
+            "A PR outcome finished without a recorded delivered PR.",
+            { existingResult: snapshot.result },
+          );
+          if (failed) {
+            await meterAgentRun("failed");
+          } else if (await reconcileTerminalSnapshotAfterResolution(snapshot.result)) {
+            await meterAgentRun("complete_no_pr");
+          }
+          return;
+        }
+
+        const reconciledResult = reconcileDeliveredPullRequests(snapshot.result, outcomePrs, {
+          currentAgentRunId: ctx.agentRun.id,
+        });
+        if (waitPlan.settledPullRequests.length > 0) {
+          const continuationOutcome = await continueSettledPullRequestLifecycle({
+            snapshotStatus: snapshot.status,
+            settledPullRequests: waitPlan.settledPullRequests,
+            now: new Date(),
+            recordInteraction: async (continuation) => {
+              const recorded = await recordInboundInteraction(db, {
+                incidentId: ctx.incident.id,
+                interaction: continuation.interaction,
+                dedupeKey: continuation.dedupeKey,
+                confirmed: true,
+              });
+              if (recorded.outcome === "skipped") return "unavailable";
+              return recorded.outcome === "duplicate" ? "duplicate" : "recorded";
+            },
+            loadPendingContextEvents: () =>
+              db.query.incidentEvents.findMany({
+                where: and(
+                  eq(schema.incidentEvents.agentRunId, ctx.agentRun.id),
+                  eq(schema.incidentEvents.kind, "human_reply"),
+                  isNull(schema.incidentEvents.processedAt),
+                ),
+                orderBy: [asc(schema.incidentEvents.createdAt)],
+              }),
+            runner,
+            sessionId,
+            incidentId: ctx.incident.id,
+            markEventsProcessed: async (ids) => {
+              await db
+                .update(schema.incidentEvents)
+                .set({ processedAt: new Date() })
+                .where(inArray(schema.incidentEvents.id, ids));
+            },
+            notifySteered: async () => {},
+          });
+          if (continuationOutcome !== "terminated" && continuationOutcome !== "unavailable") {
+            return;
+          }
+
+          const fallback = planSettledPullRequestFallback(
+            waitPlan.settledPullRequests,
+            deliveredPrs,
+          );
+          if (fallback.kind === "resolve_merged") {
+            const mergedAt = fallback.pullRequest.mergedAt ?? new Date();
+            const resolution = await resolveIncidentIfAllAgentPullRequestsMerged({
+              incidentId: ctx.incident.id,
+              kind: "agent_pr_merged",
+              reasonCode: "agent_pr_merged",
+              reasonText: `Resolved because agent PR #${fallback.pullRequest.prNumber} (${fallback.pullRequest.repoFullName}) was merged${
+                fallback.pullRequest.mergedByLogin
+                  ? ` by @${fallback.pullRequest.mergedByLogin}`
+                  : ""
+              }.`,
+              agentRunId: ctx.agentRun.id,
+              eventSummary: `Incident resolved because PR #${fallback.pullRequest.prNumber} was merged.`,
+              eventDetail: {
+                agentPrId: fallback.pullRequest.id,
+                repoFullName: fallback.pullRequest.repoFullName,
+                prNumber: fallback.pullRequest.prNumber,
+                prUrl: fallback.pullRequest.url,
+                mergedByLogin: fallback.pullRequest.mergedByLogin,
+              },
+              eventDedupeKey: `incident_resolved:agent_pr:${fallback.pullRequest.id}`,
+              resolvedAt: mergedAt,
+            });
+            if (resolution.disposition === "resolved") {
+              const completed = await completeWithoutPullRequest(
+                ctx,
+                { ...reconciledResult, state: "complete" },
+                sessionId,
+                nextRuntimeMinutes,
+                {
+                  incidentOutcome: {
+                    kind: "all_pull_requests_merged",
+                    prNumber: fallback.pullRequest.prNumber,
+                    repoFullName: fallback.pullRequest.repoFullName,
+                    resolutionProof: {
+                      agentRunId: ctx.agentRun.id,
+                      eventDedupeKey: `incident_resolved:agent_pr:${fallback.pullRequest.id}`,
+                    },
+                  },
+                },
+              );
+              if (completed) await meterAgentRun("complete_with_pr");
+              return;
+            }
+            if (resolution.disposition === "incident_not_open") {
+              const completed = await completeWithoutPullRequest(
+                ctx,
+                { ...reconciledResult, state: "complete" },
+                sessionId,
+                nextRuntimeMinutes,
+                { incidentOutcome: { kind: "incident_already_closed" } },
+              );
+              if (completed) await meterAgentRun("complete_with_pr");
+              return;
+            }
+          }
+
+          const interactions = waitPlan.settledPullRequests.flatMap((pullRequest) => {
+            const continuation = buildAgentPullRequestLifecycleContinuation({
+              pullRequest,
+              fallbackOccurredAt: new Date(),
+            });
+            return continuation ? [continuation.interaction] : [];
+          });
+          const handoff = await agentRunLifecycle.handoffTerminatedSessionToFollowUp({
+            id: ctx.agentRun.id,
+            incidentId: ctx.incident.id,
+            currentState: ctx.agentRun.state,
+            runtime: ctx.agentRun.runtime,
+            interactions,
+            existingResult: reconciledResult,
+          });
+          if (handoff.kind === "enqueued") {
+            logger.info(
+              {
+                agent_run_id: ctx.agentRun.id,
+                follow_up_agent_run_id: handoff.agentRunId,
+                incident_id: ctx.incident.id,
+                settled_pull_request_count: waitPlan.settledPullRequests.length,
+              },
+              "queued pull request lifecycle follow-up after the provider session ended",
+            );
+          } else if (handoff.kind === "incident_not_open") {
+            const completed = await completeWithoutPullRequest(
+              ctx,
+              { ...reconciledResult, state: "complete" },
+              sessionId,
+              nextRuntimeMinutes,
+            );
+            if (completed) await meterAgentRun("complete_with_pr");
+          }
+          return;
+        }
+        const parkOutcome = await moveAgentRunToAwaitingEvents(
+          ctx,
+          reconciledResult,
+          waitPlan.openPrUrls,
+          waitPlan.openPrUrls.length === 0
+            ? undefined
+            : async () => {
+                const linearTicket = await scheduleLinearHandoff(
+                  ctx,
+                  reconciledResult,
+                  `awaiting_events:${waitPlan.openPrUrls.join(",")}`,
+                );
+                return linearTicket
+                  ? { identifier: linearTicket.identifier, url: linearTicket.url }
+                  : null;
+              },
+        );
+        const transition = planAwaitingEventsTransition(reconciledResult, parkOutcome);
+        if (transition.kind === "complete") {
+          const completed = await agentRunLifecycle.completeWithoutPullRequest({
+            id: ctx.agentRun.id,
+            currentState: ctx.agentRun.state,
+            result: transition.result,
+            providerSessionIdToTerminate: sessionId,
+          });
+          if (completed) {
+            await meterAgentRun(
+              outcomePrs.length > 0 ? "complete_with_pr" : "complete_no_pr",
+              outcomePrs.length > 0,
+            );
+          }
+          return;
+        }
+        if (transition.kind === "parked") {
+          await meterAgentRun("awaiting_events", waitPlan.openPrUrls.length > 0);
+        } else if (
+          transition.kind === "skip" &&
+          (await reconcileTerminalSnapshotAfterResolution(reconciledResult))
+        ) {
+          await meterAgentRun(
+            outcomePrs.length > 0 ? "complete_with_pr" : "complete_no_pr",
+            outcomePrs.length > 0,
+          );
+        }
         return;
       }
 
@@ -572,35 +1068,54 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
           approvalPromptToolsAvailable: true,
         })
       ) {
-        await failAgentRun(
+        const failed = await failAgentRun(
           ctx,
           "sync_failed",
           "Investigation tried to finish while a remediation intervention was still available.",
           { existingResult: snapshot.result },
         );
-        await meterAgentRun("failed");
+        if (failed) {
+          await meterAgentRun("failed");
+        } else if (await reconcileTerminalSnapshotAfterResolution(snapshot.result)) {
+          await meterAgentRun("complete_no_pr");
+        }
         return;
       }
 
       if (snapshot.result.state === "complete" && snapshot.result.incidentResolution) {
-        // Terminal resolve_incident (multi-PR contract): issues were
-        // classified and PRs delivered mid-run; this resolves the incident.
+        // The successful terminal ack means resolve_incident already committed
+        // every Issue outcome and the Incident resolution atomically. This
+        // path persists the run result and reconciles dependent deliverables.
         const hasPr = !!(await db.query.agentPullRequests.findFirst({
           where: eq(schema.agentPullRequests.incidentId, ctx.incident.id),
           columns: { id: true },
         }));
-        await completeWithIncidentResolution(ctx, snapshot.result, sessionId, nextRuntimeMinutes);
-        await meterAgentRun(hasPr ? "complete_with_pr" : "complete_no_pr");
+        const completed = await completeWithIncidentResolution(
+          ctx,
+          snapshot.result,
+          sessionId,
+          nextRuntimeMinutes,
+        );
+        if (completed) await meterAgentRun(hasPr ? "complete_with_pr" : "complete_no_pr");
         return;
       }
 
       if (snapshot.result.state === "complete") {
         const pr = snapshot.result.pr ?? null;
         if (pr && pr.validationPassed === false) {
-          await failAgentRun(ctx, "patch_validation_failed", snapshot.result.summary, {
-            existingResult: snapshot.result,
-          });
-          await meterAgentRun("failed");
+          const failed = await failAgentRun(
+            ctx,
+            "patch_validation_failed",
+            snapshot.result.summary,
+            {
+              existingResult: snapshot.result,
+            },
+          );
+          if (failed) {
+            await meterAgentRun("failed");
+          } else if (await reconcileTerminalSnapshotAfterResolution(snapshot.result)) {
+            await meterAgentRun("complete_no_pr");
+          }
           return;
         }
         const merged = await tryMergeAfterAgentRun(
@@ -625,11 +1140,24 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
           pr.openStatus === "pending" &&
           ctx.prPolicy !== "never";
         if (shouldOpenPr && pr) {
-          await completeWithPullRequest(ctx, snapshot.result, pr, sessionId, nextRuntimeMinutes);
-          await meterAgentRun("complete_with_pr");
+          const completed = await completeWithPullRequest(
+            ctx,
+            snapshot.result,
+            pr,
+            sessionId,
+            nextRuntimeMinutes,
+          );
+          await meterAgentRunCompletionIfClaimed(completed, () =>
+            meterAgentRun("complete_with_pr"),
+          );
         } else {
-          await completeWithoutPullRequest(ctx, snapshot.result, sessionId, nextRuntimeMinutes);
-          await meterAgentRun("complete_no_pr");
+          const completed = await completeWithoutPullRequest(
+            ctx,
+            snapshot.result,
+            sessionId,
+            nextRuntimeMinutes,
+          );
+          if (completed) await meterAgentRun("complete_no_pr");
         }
         return;
       }
@@ -666,32 +1194,42 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
       return;
     }
 
-    // Idle with no terminal call but with PRs out for review: a legitimate
-    // end state in the multi-PR contract. Park the run — the durable session
-    // is resumed by PR comment/merge/close webhooks (or any human message).
+    // Compatibility path for a durable session created before propose_pr
+    // became terminal: park its already-delivered PR while it waits for a PR
+    // event or human message.
     if (snapshot.status === "idle" && !snapshot.result) {
       const openPrs = await db.query.agentPullRequests.findMany({
         where: and(
           eq(schema.agentPullRequests.incidentId, ctx.incident.id),
           eq(schema.agentPullRequests.state, "open"),
         ),
-        columns: { url: true },
+        columns: {
+          repoFullName: true,
+          branchName: true,
+          baseBranch: true,
+          title: true,
+          url: true,
+        },
+        orderBy: [asc(schema.agentPullRequests.createdAt), asc(schema.agentPullRequests.id)],
       });
-      if (openPrs.length > 0) {
-        const parkedResult = assembleAgentRunResult({
-          findings: snapshot.pendingOutcome?.findings ?? null,
-          terminal: null,
-          actions: snapshot.pendingOutcome?.actions ?? [],
-        });
-        // Land the turn's findings on the incident before parking, so the
-        // dashboard shows them while the run waits. Skipped when the turn
-        // recorded no findings — an empty summary must not blank out
-        // findings from an earlier turn.
-        if (snapshot.pendingOutcome?.findings) {
-          await applyIncidentMetadataFromResult(ctx, parkedResult);
-        }
+      if (
+        shouldParkCompatibilityPullRequests({
+          openPullRequestCount: openPrs.length,
+          blockingPullRequestDeliveryKind:
+            snapshot.blockingPullRequestDelivery?.kind ??
+            (snapshot.partialPullRequestDelivery ? "retry_required" : null),
+        })
+      ) {
+        const parkedResult = reconcileDeliveredPullRequests(
+          assembleAgentRunResult({
+            findings: snapshot.pendingOutcome?.findings ?? null,
+            terminal: null,
+            actions: snapshot.pendingOutcome?.actions ?? [],
+          }),
+          openPrs,
+        );
         const openPrUrls = openPrs.map((pr) => pr.url);
-        const parked = await moveAgentRunToAwaitingEvents(
+        const parkOutcome = await moveAgentRunToAwaitingEvents(
           ctx,
           parkedResult,
           openPrUrls,
@@ -717,22 +1255,21 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
               return null;
             }
           },
+          !!snapshot.pendingOutcome?.findings,
         );
+        const transition = planAwaitingEventsTransition(parkedResult, parkOutcome);
+        if (transition.kind === "complete") {
+          const completed = await agentRunLifecycle.completeWithoutPullRequest({
+            id: ctx.agentRun.id,
+            currentState: ctx.agentRun.state,
+            result: transition.result,
+          });
+          if (completed) await meterAgentRun("complete_with_pr");
+          return;
+        }
         // A lost park means a concurrent pass owns this turn's conclusion —
         // it also records the usage, so a duplicate here would double-meter.
-        if (parked) {
-          await recordAgentRunCompletion({
-            orgId: ctx.project.orgId,
-            projectId: ctx.project.id,
-            incidentId: ctx.incident.id,
-            model: snapshot.modelUsage.model,
-            callSite: "agent_run",
-            usage: snapshot.modelUsage,
-            activeSeconds: snapshot.activeSeconds,
-            outcome: "awaiting_events",
-            hasPr: true,
-          });
-        }
+        if (transition.kind === "parked") await meterAgentRun("awaiting_events", true);
         return;
       }
     }
@@ -746,7 +1283,14 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
       // index on (agent_run_id, provider_event_id) makes exactly one insert
       // win. If the steer then fails, the one-shot nudge is spent — the
       // wall-clock/runtime backstops still own the run.
-      const nudgeEventId = `terminal_nudge:${sessionId}`;
+      const pendingRepoFullNames = snapshot.partialPullRequestDelivery?.pendingRepoFullNames ?? [];
+      const partialRetryPrompt =
+        pendingRepoFullNames.length > 0
+          ? partialPullRequestRetryNudgePrompt(pendingRepoFullNames)
+          : null;
+      const nudgeEventId = partialRetryPrompt
+        ? `partial_pr_retry_nudge:${sessionId}:${pendingRepoFullNames.join(",")}`
+        : `terminal_nudge:${sessionId}`;
       const claimed = await db
         .insert(schema.incidentEvents)
         .values({
@@ -765,19 +1309,24 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
         // landed. The delivered nudge is visible in the session's own event
         // stream, so a retry can detect it and keep the claim without
         // steering a duplicate.
-        const nudgePrompt = terminalOutcomeNudgePrompt({
-          completeInvestigationAvailable: completeInvestigationAvailable({
-            prPolicy: ctx.prPolicy,
-            githubConnected: ctx.githubInstalls.length > 0,
-            approvalPromptsEnabled: ctx.approvalPromptsEnabled,
-            approvalPromptToolsAvailable: true,
-          }),
-        });
+        const nudgePrompt =
+          partialRetryPrompt ??
+          terminalOutcomeNudgePrompt({
+            completeInvestigationAvailable: completeInvestigationAvailable({
+              prPolicy: ctx.prPolicy,
+              githubConnected: ctx.githubInstalls.length > 0,
+              approvalPromptsEnabled: ctx.approvalPromptsEnabled,
+              approvalPromptToolsAvailable: true,
+            }),
+          });
+        const redeliveryMarker = partialRetryPrompt
+          ? `${PARTIAL_PULL_REQUEST_RETRY_NUDGE_MARKER} ${JSON.stringify(pendingRepoFullNames)}`
+          : TERMINAL_OUTCOME_NUDGE_MARKER;
         const nudgeAlreadyDelivered = snapshot.events.some(
           (event) =>
             event.type === "user.message" &&
             !!event.summary &&
-            event.summary.includes(TERMINAL_OUTCOME_NUDGE_MARKER),
+            event.summary.includes(redeliveryMarker),
         );
         if (!nudgeAlreadyDelivered) {
           try {

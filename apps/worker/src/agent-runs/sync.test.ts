@@ -3,16 +3,399 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { TERMINAL_OUTCOME_NUDGE_MARKER } from "../agent-outcome-tools.js";
 import {
+  continueSettledPullRequestLifecycle,
   isCompleteInvestigationAllowed,
   isSessionBusyError,
+  meterAgentRunCompletionIfClaimed,
   mobileRegressionGateState,
   mobileRegressionGateTerminatedSummary,
   mobileRegressionRepairPrompt,
   needsMobileRegressionRepair,
+  partialPullRequestRetryNudgePrompt,
+  planAwaitingEventsTransition,
+  planPullRequestAwaitingEvents,
+  planSettledPullRequestFallback,
+  selectDeliveredPullRequestsForCurrentTurn,
   shouldDeferSteering,
+  shouldFailForRuntimeBudget,
+  shouldParkCompatibilityPullRequests,
   steerIdleRunnerWithPendingContext,
   terminalOutcomeNudgePrompt,
 } from "./sync.js";
+
+test("completion metering runs only for the sync pass that claimed the transition", async () => {
+  let metered = 0;
+  const meter = async () => {
+    metered += 1;
+  };
+
+  assert.equal(await meterAgentRunCompletionIfClaimed(false, meter), false);
+  assert.equal(metered, 0);
+  assert.equal(await meterAgentRunCompletionIfClaimed(true, meter), true);
+  assert.equal(metered, 1);
+});
+
+test("an incident-closed park outcome completes the terminal result instead of awaiting events", () => {
+  const result = {
+    state: "awaiting_events" as const,
+    summary: "Opened the fix and waited for review.",
+  };
+
+  assert.deepEqual(
+    planAwaitingEventsTransition(result, {
+      kind: "incident_not_open",
+      incidentStatus: "resolved",
+    }),
+    {
+      kind: "complete",
+      incidentStatus: "resolved",
+      result: { ...result, state: "complete" },
+    },
+  );
+  assert.deepEqual(planAwaitingEventsTransition(result, { kind: "parked" }), {
+    kind: "parked",
+  });
+  assert.deepEqual(planAwaitingEventsTransition(result, { kind: "run_not_running" }), {
+    kind: "skip",
+  });
+});
+
+test("delivered PRs satisfy terminal sync while only open PRs remain wait targets", () => {
+  const result = {
+    state: "awaiting_events" as const,
+    summary: "Delivered remediation.",
+  };
+  const deliveredPullRequests = [
+    { state: "merged" as const, url: "https://github.com/acme/api/pull/1" },
+    { state: "closed" as const, url: "https://github.com/acme/web/pull/2" },
+    { state: "open" as const, url: "https://github.com/acme/worker/pull/3" },
+  ];
+
+  assert.deepEqual(planPullRequestAwaitingEvents(result, deliveredPullRequests), {
+    shouldFail: false,
+    openPrUrls: ["https://github.com/acme/worker/pull/3"],
+    settledPullRequests: deliveredPullRequests.slice(0, 2),
+  });
+  assert.deepEqual(planPullRequestAwaitingEvents(result, deliveredPullRequests.slice(0, 2)), {
+    shouldFail: false,
+    openPrUrls: [],
+    settledPullRequests: deliveredPullRequests.slice(0, 2),
+  });
+  assert.deepEqual(planPullRequestAwaitingEvents(result, []), {
+    shouldFail: true,
+    openPrUrls: [],
+    settledPullRequests: [],
+  });
+  assert.deepEqual(planPullRequestAwaitingEvents({ ...result, waitReason: "external_cause" }, []), {
+    shouldFail: false,
+    openPrUrls: [],
+    settledPullRequests: [],
+  });
+  assert.deepEqual(
+    planPullRequestAwaitingEvents(
+      { ...result, waitReason: "external_cause" },
+      deliveredPullRequests.slice(0, 1),
+    ),
+    {
+      shouldFail: false,
+      openPrUrls: [],
+      settledPullRequests: [],
+    },
+  );
+});
+
+test("a resumed same-run turn excludes pull request receipts from the prior turn", () => {
+  const firstPullRequest = {
+    id: "pr-1",
+    agentRunId: "run-1",
+    repoFullName: "acme/api",
+    branchName: "ash/fix-api",
+    baseBranch: "main",
+    title: "Fix API",
+    url: "https://github.com/acme/api/pull/1",
+    state: "merged" as const,
+  };
+  const secondPullRequest = {
+    id: "pr-2",
+    agentRunId: "run-1",
+    repoFullName: "acme/web",
+    branchName: "ash/fix-web",
+    baseBranch: "main",
+    title: "Fix web",
+    url: "https://github.com/acme/web/pull/2",
+    state: "open" as const,
+  };
+  const receiptDetail = (
+    deliveryId: string,
+    pullRequest: { id: string; repoFullName: string; branchName: string; url: string },
+  ) => ({
+    deliveryId,
+    inputHash: `input-${deliveryId}`,
+    repoFullName: pullRequest.repoFullName,
+    requestedBranchName: pullRequest.branchName,
+    branchName: pullRequest.branchName,
+    url: pullRequest.url,
+    prNumber: pullRequest.id === "pr-1" ? 1 : 2,
+    updatedExisting: false,
+    headSha: `sha-${deliveryId}`,
+  });
+
+  const selected = selectDeliveredPullRequestsForCurrentTurn(
+    {
+      state: "awaiting_events",
+      summary: "Delivered the follow-up web fix.",
+      prs: [
+        {
+          selectedRepoFullName: secondPullRequest.repoFullName,
+          branchName: secondPullRequest.branchName,
+          baseBranch: "main",
+          url: secondPullRequest.url,
+          openStatus: "opened",
+        },
+      ],
+    },
+    [firstPullRequest, secondPullRequest],
+    "run-1",
+    [
+      {
+        detail: receiptDetail("delivery-1", firstPullRequest),
+        createdAt: new Date("2026-07-15T08:00:00.000Z"),
+      },
+      {
+        detail: receiptDetail("delivery-2", secondPullRequest),
+        createdAt: new Date("2026-07-15T10:00:00.000Z"),
+      },
+    ],
+    new Date("2026-07-15T09:00:00.000Z"),
+  );
+
+  assert.deepEqual(selected, [secondPullRequest]);
+});
+
+test("a recovered merged PR continues its lifecycle instead of completing the run", () => {
+  const result = {
+    state: "awaiting_events" as const,
+    summary: "Delivered remediation.",
+  };
+  const mergedPullRequest = {
+    id: "agent-pr-1",
+    state: "merged" as const,
+    url: "https://github.com/acme/api/pull/1",
+  };
+
+  assert.deepEqual(planPullRequestAwaitingEvents(result, [mergedPullRequest]), {
+    shouldFail: false,
+    openPrUrls: [],
+    settledPullRequests: [mergedPullRequest],
+  });
+});
+
+test("an idle recovered merged PR is recorded and steered through the lifecycle continuation", async () => {
+  const recorded: Array<{ channel: string; text: string; dedupeKey: string }> = [];
+  const steered: string[] = [];
+  const processed: string[][] = [];
+
+  const outcome = await continueSettledPullRequestLifecycle({
+    snapshotStatus: "idle",
+    settledPullRequests: [
+      {
+        id: "agent-pr-1",
+        state: "merged",
+        url: "https://github.com/acme/api/pull/1",
+        repoFullName: "acme/api",
+        branchName: "ash/fix-api",
+        prNumber: 1,
+        mergedAt: new Date("2026-07-15T08:30:00.000Z"),
+        closedAt: null,
+        mergedByLogin: "octocat",
+      },
+    ],
+    now: new Date("2026-07-15T09:00:00.000Z"),
+    async recordInteraction(continuation) {
+      recorded.push({
+        channel: continuation.interaction.channel,
+        text: continuation.interaction.text,
+        dedupeKey: continuation.dedupeKey,
+      });
+      return "recorded";
+    },
+    async loadPendingContextEvents() {
+      return [{ id: "event-1", summary: recorded[0]?.text ?? null }];
+    },
+    runner: {
+      async steer(_sessionId, message) {
+        steered.push(message);
+      },
+    },
+    sessionId: "session-1",
+    incidentId: "incident-1",
+    async markEventsProcessed(ids) {
+      processed.push(ids);
+    },
+    async notifySteered() {},
+  });
+
+  assert.equal(outcome, "steered");
+  assert.deepEqual(recorded, [
+    {
+      channel: "pr_merged",
+      text: "Your PR #1 (acme/api, branch `ash/fix-api`) was merged by @octocat. If this completes the remediation, make sure every linked issue is classified and call resolve_incident; if more work remains (other PRs still open, issues unclassified), continue it.",
+      dedupeKey: "agent_pr_merged:agent-pr-1",
+    },
+  ]);
+  assert.deepEqual(steered, [recorded[0]?.text]);
+  assert.deepEqual(processed, [["event-1"]]);
+});
+
+test("a deduped recovered lifecycle retry still steers its pending event", async () => {
+  let pendingLoads = 0;
+  const processed: string[][] = [];
+
+  const outcome = await continueSettledPullRequestLifecycle({
+    snapshotStatus: "idle",
+    settledPullRequests: [
+      {
+        id: "agent-pr-1",
+        state: "merged",
+        url: "https://github.com/acme/api/pull/1",
+        repoFullName: "acme/api",
+        branchName: "ash/fix-api",
+        prNumber: 1,
+        mergedAt: new Date("2026-07-15T08:30:00.000Z"),
+        closedAt: null,
+        mergedByLogin: null,
+      },
+    ],
+    now: new Date("2026-07-15T09:00:00.000Z"),
+    async recordInteraction() {
+      return "duplicate";
+    },
+    async loadPendingContextEvents() {
+      pendingLoads += 1;
+      return [{ id: "event-1", summary: "The PR was merged." }];
+    },
+    runner: {
+      async steer() {
+        throw new Error("400 ... waiting on responses to events [sevt_1] ...");
+      },
+    },
+    sessionId: "session-1",
+    incidentId: "incident-1",
+    async markEventsProcessed(ids) {
+      processed.push(ids);
+    },
+    async notifySteered() {},
+  });
+
+  assert.equal(outcome, "busy");
+  assert.equal(pendingLoads, 1);
+  assert.deepEqual(processed, []);
+});
+
+test("a terminated recovered lifecycle goes straight to follow-up without recording a stale reply", async () => {
+  let recordAttempts = 0;
+  let pendingLoads = 0;
+
+  const outcome = await continueSettledPullRequestLifecycle({
+    snapshotStatus: "terminated",
+    settledPullRequests: [
+      {
+        id: "agent-pr-1",
+        state: "merged",
+        url: "https://github.com/acme/api/pull/1",
+        repoFullName: "acme/api",
+        branchName: "ash/fix-api",
+        prNumber: 1,
+        mergedAt: new Date("2026-07-15T08:30:00.000Z"),
+        closedAt: null,
+        mergedByLogin: null,
+      },
+    ],
+    now: new Date("2026-07-15T09:00:00.000Z"),
+    async recordInteraction() {
+      recordAttempts += 1;
+      return "recorded";
+    },
+    async loadPendingContextEvents() {
+      pendingLoads += 1;
+      return [];
+    },
+    runner: { async steer() {} },
+    sessionId: "session-1",
+    incidentId: "incident-1",
+    async markEventsProcessed() {},
+    async notifySteered() {},
+  });
+
+  assert.equal(outcome, "terminated");
+  assert.equal(recordAttempts, 0);
+  assert.equal(pendingLoads, 0);
+});
+
+test("an unavailable recovered PR lifecycle resolves only an entirely merged delivery", () => {
+  const merged = {
+    id: "agent-pr-merged",
+    state: "merged" as const,
+    url: "https://github.com/acme/api/pull/1",
+    repoFullName: "acme/api",
+    branchName: "ash/fix-api",
+    baseBranch: "main",
+    prNumber: 1,
+    mergedAt: new Date("2026-07-15T08:30:00.000Z"),
+    closedAt: null,
+    mergedByLogin: "octocat",
+  };
+  const closed = {
+    ...merged,
+    id: "agent-pr-closed",
+    state: "closed" as const,
+    mergedAt: null,
+    closedAt: new Date("2026-07-15T08:45:00.000Z"),
+    mergedByLogin: null,
+  };
+  const open = {
+    ...merged,
+    id: "agent-pr-open",
+    state: "open" as const,
+    url: "https://github.com/acme/worker/pull/3",
+    repoFullName: "acme/worker",
+    branchName: "ash/fix-worker",
+    prNumber: 3,
+    mergedAt: null,
+    mergedByLogin: null,
+  };
+
+  assert.deepEqual(planSettledPullRequestFallback([merged], [merged]), {
+    kind: "resolve_merged",
+    pullRequest: merged,
+  });
+  assert.deepEqual(planSettledPullRequestFallback([merged], [open, merged]), {
+    kind: "follow_up",
+  });
+  assert.deepEqual(planSettledPullRequestFallback([closed, merged], [closed, merged]), {
+    kind: "follow_up",
+  });
+  assert.deepEqual(planSettledPullRequestFallback([closed], [closed]), { kind: "follow_up" });
+});
+
+test("a terminal result wins when it lands at the runtime budget boundary", () => {
+  assert.equal(
+    shouldFailForRuntimeBudget({
+      activeRuntimeMinutes: 30,
+      maxRuntimeMinutes: 30,
+      hasResult: true,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldFailForRuntimeBudget({
+      activeRuntimeMinutes: 30,
+      maxRuntimeMinutes: 30,
+      hasResult: false,
+    }),
+    true,
+  );
+});
 
 test("complete_investigation is rejected when an intervention is available", () => {
   const result = {
@@ -393,9 +776,7 @@ test("terminalOutcomeNudgePrompt names every outcome tool", () => {
   for (const name of [
     "report_findings",
     "propose_pr",
-    "silence_as_noise",
-    "place_under_observation",
-    "resolve_issue",
+    "report_external_cause",
     "resolve_incident",
     "ask_human",
   ]) {
@@ -407,6 +788,48 @@ test("terminalOutcomeNudgePrompt uses complete_investigation when interventions 
   const prompt = terminalOutcomeNudgePrompt({ completeInvestigationAvailable: true });
   assert.match(prompt, /complete_investigation/);
   assert.doesNotMatch(prompt, /propose_pr/);
+});
+
+test("partialPullRequestRetryNudgePrompt requires exactly the pending repositories", () => {
+  const prompt = partialPullRequestRetryNudgePrompt(["acme/worker", "acme/web"]);
+
+  assert.equal(prompt.split("\n")[0], TERMINAL_OUTCOME_NUDGE_MARKER);
+  assert.match(prompt, /retry.*propose_pr/i);
+  assert.match(prompt, /acme\/worker/);
+  assert.match(prompt, /acme\/web/);
+  assert.match(prompt, /exactly/i);
+  assert.doesNotMatch(prompt, /resolve_incident|report_external_cause|ask_human/);
+});
+
+test("blocking PR delivery cannot enter the legacy open-PR parking path", () => {
+  assert.equal(
+    shouldParkCompatibilityPullRequests({
+      openPullRequestCount: 1,
+      blockingPullRequestDeliveryKind: null,
+    }),
+    true,
+  );
+  for (const blockingPullRequestDeliveryKind of [
+    "retry_required",
+    "incident_not_open",
+    "manual_reconciliation_required",
+  ] as const) {
+    assert.equal(
+      shouldParkCompatibilityPullRequests({
+        openPullRequestCount: 1,
+        blockingPullRequestDeliveryKind,
+      }),
+      false,
+      blockingPullRequestDeliveryKind,
+    );
+  }
+  assert.equal(
+    shouldParkCompatibilityPullRequests({
+      openPullRequestCount: 0,
+      blockingPullRequestDeliveryKind: null,
+    }),
+    false,
+  );
 });
 
 test("isSessionBusyError matches the mid-flight steer rejection only", () => {

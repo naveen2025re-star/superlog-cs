@@ -17,6 +17,9 @@ type RecordedCall =
   | { op: "insert.returning"; table: unknown; values: Record<string, unknown> }
   | { op: "insert.onConflictDoNothing"; table: unknown; values: Record<string, unknown> }
   | { op: "update.where"; table: unknown; values: Record<string, unknown> }
+  | { op: "select.forUpdate"; table: unknown }
+  | { op: "select.orderBy.forUpdate" }
+  | { op: "execute" }
   | { op: "transaction.begin" }
   | { op: "transaction.end" };
 
@@ -27,6 +30,8 @@ function recordingDb(
     updateReturningRows?: Record<string, unknown>[];
     incidentIssueLinks?: schema.IncidentIssue[];
     currentIssues?: Array<Record<string, unknown>>;
+    lockedIncidents?: schema.Incident[];
+    incidentResolutionEventExists?: boolean;
   } = {},
 ): {
   db: DB;
@@ -62,6 +67,30 @@ function recordingDb(
     },
   });
   const db = {
+    select() {
+      return {
+        from(table: unknown) {
+          return {
+            where() {
+              return {
+                async for() {
+                  calls.push({ op: "select.forUpdate", table });
+                  return table === schema.agentRuns ? [] : (opts.lockedIncidents ?? []);
+                },
+                orderBy() {
+                  return {
+                    async for() {
+                      calls.push({ op: "select.orderBy.forUpdate" });
+                      return opts.lockedIncidents ?? [makeIncident("open")];
+                    },
+                  };
+                },
+              };
+            },
+          };
+        },
+      };
+    },
     insert: insertChain,
     update: updateChain,
     delete(_table: unknown) {
@@ -70,6 +99,7 @@ function recordingDb(
     // Raw SQL surface used by listCurrentIssuesForIncidentInTx and the merge
     // repoint. Return the current issues' ids so the resolve cascade runs.
     async execute() {
+      calls.push({ op: "execute" });
       return (opts.currentIssues ?? []).map((issue) => ({ id: issue.id }));
     },
     query: {
@@ -86,6 +116,11 @@ function recordingDb(
       issues: {
         async findMany() {
           return opts.currentIssues ?? [];
+        },
+      },
+      incidentEvents: {
+        async findFirst() {
+          return opts.incidentResolutionEventExists ? { id: "event-1" } : undefined;
         },
       },
     },
@@ -433,30 +468,37 @@ test("resolve is idempotent when the incident is no longer open", async () => {
   );
 });
 
-test("merge moves an open source incident into an open target incident", async () => {
+test("merge locks and reloads an open source and target before moving issue links", async () => {
   const mergedAt = new Date(4_000);
-  const { db, calls } = recordingDb();
+  const sourceIncident = makeIncident("open", {
+    id: "inc-source",
+    issueCount: 2,
+    lastSeen: new Date(5_000),
+  });
+  const targetIncident = makeIncident("open", {
+    id: "inc-target",
+    issueCount: 3,
+    lastSeen: new Date(2_000),
+  });
+  const lockedSource = { ...sourceIncident, issueCount: 4, lastSeen: new Date(7_000) };
+  const lockedTarget = { ...targetIncident, issueCount: 5, lastSeen: new Date(6_000) };
+  const { db, calls } = recordingDb({ lockedIncidents: [lockedSource, lockedTarget] });
 
   await mergeIncidentsInTx(db as unknown as Parameters<typeof mergeIncidentsInTx>[0], {
-    sourceIncident: makeIncident("open", {
-      id: "inc-source",
-      issueCount: 2,
-      lastSeen: new Date(5_000),
-    }),
-    targetIncident: makeIncident("open", {
-      id: "inc-target",
-      issueCount: 3,
-      lastSeen: new Date(2_000),
-    }),
+    sourceIncident,
+    targetIncident,
     mergedAt,
   });
 
   const updates = incidentUpdates(calls);
+  const lockIndex = calls.findIndex((call) => call.op === "select.orderBy.forUpdate");
+  const moveLinksIndex = calls.findIndex((call) => call.op === "execute");
+  assert.ok(lockIndex >= 0 && moveLinksIndex > lockIndex, "both rows lock before links move");
   assert.equal(updates.length, 2, "source and target incidents should both be updated");
   assert.equal(updates[0]?.status, "merged");
   assert.equal(updates[0]?.mergedIntoId, "inc-target");
   assert.equal(updates[0]?.mergedAt, mergedAt);
-  assert.equal((updates[1]?.lastSeen as Date).getTime(), 5_000);
+  assert.equal((updates[1]?.lastSeen as Date).getTime(), 7_000);
 });
 
 test("merge rejects closed source or target incidents before writing", async () => {
@@ -479,11 +521,12 @@ test("merge rejects closed source or target incidents before writing", async () 
 });
 
 test("manual reopen clears both resolution and noise metadata", async () => {
-  const { db, calls } = recordingDb();
+  const incident = makeIncident("autoresolved_noise");
+  const { db, calls } = recordingDb({ lockedIncidents: [incident] });
   const lifecycle = createIncidentLifecycle(db);
 
   const result = await lifecycle.reopenManually({
-    incident: makeIncident("autoresolved_noise"),
+    incident,
     actor: { userId: "user-1" },
     summary: "Incident reopened from test.",
   });

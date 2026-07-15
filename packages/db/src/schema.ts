@@ -100,8 +100,27 @@ export type AgentRunPr = {
   validationCommands?: string[];
   validationSummary?: string | null;
   changedFiles?: string[];
+  // Per-repository mobile regression decision for batched PR outcomes.
+  // `AgentRunResult.mobileRegressionTest` remains the legacy singular mirror.
+  mobileRegressionTest?: AgentRunMobileRegressionTest | null;
   openStatus: "pending" | "opened";
   url?: string | null;
+};
+
+// Manual recovery contract for a GitHub PR mutation whose compensating close
+// could not be verified. Persisted with an awaiting_human result so a resumed
+// turn and every UI/API reader retain the exact repository operation a person
+// must reconcile; this is JSON-only metadata and requires no schema migration.
+export type AgentRunPullRequestManualReconciliation = {
+  actionRequired: "close_pull_request" | "sync_canonical_state";
+  repoFullName: string;
+  branchName: string;
+  prUrl: string;
+  prNumber: number;
+  reconciliationReason: "incident_not_open" | "reconciliation_failed";
+  reconciliationError: string | null;
+  closeError: string | null;
+  canonicalState: AgentPrState | null;
 };
 
 export type AgentRunLinearTicket = {
@@ -245,6 +264,10 @@ export type AgentRunFollowUpTrigger = Exclude<AgentRunTrigger, "incident" | "man
 
 export type AgentRunFollowUpInteraction = {
   channel: AgentRunFollowUpTrigger;
+  // Stable identity for PR lifecycle interactions. This lets a worker that
+  // discovers a reclaimed provider session apply the same incident-wide
+  // fallback as the webhook without inferring identity from display text.
+  agentPrId?: string;
   author: string | null;
   text: string;
   // PR comments: the comment URL and, for review comments, the file/line.
@@ -254,8 +277,23 @@ export type AgentRunFollowUpInteraction = {
   occurredAt: string;
 };
 
+// Durable identity for every still-open pull request carried into a cold-start
+// follow-up. A batched delivery can outlive the provider session, so the
+// successor must not have to infer the remaining work from the legacy single
+// `result.pr` field.
+export type AgentRunFollowUpPullRequest = {
+  agentPrId: string;
+  repoFullName: string;
+  prNumber: number;
+  url: string;
+  branchName: string;
+  baseBranch: string;
+  state: AgentPrState;
+};
+
 export type AgentRunTriggerDetail = {
   interactions: AgentRunFollowUpInteraction[];
+  pullRequests?: AgentRunFollowUpPullRequest[];
 };
 
 // Lifecycle of a provider Q&A chat (one row per Slack thread / DM channel or
@@ -266,9 +304,9 @@ export type AgentRunTriggerDetail = {
 // failed: the last turn failed; a new inbound message re-queues it.
 export type AgentChatState = "queued" | "running" | "idle" | "failed";
 
-// One issue-level verdict recorded by the agent mid-run. The issue row itself
-// is the source of truth (the status change is applied when the tool call is
-// dispatched); this is the run-result record of what was decided and why.
+// One issue-level verdict recorded by the agent. New runs supply the complete
+// set through terminal resolve_incident and commit it atomically with the
+// Incident; persisted legacy runs may contain earlier action-by-action data.
 export type AgentRunIssueClassification = {
   issueId: string;
   action: "silence" | "observe" | "resolve";
@@ -283,13 +321,24 @@ export type AgentRunIncidentResolution = {
   evidence: string;
 };
 
+export type AgentRunExternalCause = {
+  cause: string;
+  source: string;
+  evidence: string;
+  recommendedNextStep: string;
+};
+
 export type AgentRunResult = {
   state: "complete" | "awaiting_human" | "awaiting_events" | "failed";
   summary: string;
   // Explicit terminal signal for runs that finish their investigation while
   // deliberately leaving the incident open for an external ticket workflow.
   completionKind?: "investigation_complete" | null;
+  // Why an awaiting_events run is parked when it is not waiting on a PR.
+  waitReason?: "external_cause" | null;
+  externalCause?: AgentRunExternalCause | null;
   question?: string | null;
+  manualReconciliation?: AgentRunPullRequestManualReconciliation | null;
   failureReason?: AgentRunFailureReason | null;
   // Legacy single-PR record (pre multi-PR contract). New runs record opened
   // PRs as agent_pull_requests rows (the source of truth) and mirror them in
@@ -298,6 +347,10 @@ export type AgentRunResult = {
   prs?: AgentRunPr[] | null;
   issueClassifications?: AgentRunIssueClassification[] | null;
   incidentResolution?: AgentRunIncidentResolution | null;
+  // Stable receipt for the exact resolve_incident tool use whose atomic
+  // lifecycle transaction this result describes. Run IDs are reused across
+  // resumed turns, so completion must prove against this per-call key.
+  incidentResolutionEventDedupeKey?: string | null;
   linearTicket?: AgentRunLinearTicket | null;
   rootCauseConfidence?: "high" | "medium" | "low" | null;
   // Concise human-readable replacement for incident.title — applied by the worker if present.
@@ -1268,6 +1321,10 @@ export const agentPullRequests = pgTable(
     // GitHub and a later merge supersedes both signals in the metric.
     negativeReactionAt: timestamp("negative_reaction_at", { withTimezone: true }),
     expiredAt: timestamp("expired_at", { withTimezone: true }),
+    // Monotonic watermark from GitHub's pull_request.updated_at. Keep this
+    // separate from lastSyncedAt: provider timestamps have second precision
+    // and may be behind the worker/API host clock used for local reconciliation.
+    providerUpdatedAt: timestamp("provider_updated_at", { withTimezone: true }),
     lastSyncedAt: timestamp("last_synced_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
@@ -2025,6 +2082,7 @@ export function isValidPrBaseBranch(value: string): boolean {
   if (branch === "@" || branch.startsWith("/") || branch.endsWith("/")) return false;
   if (branch.endsWith(".") || branch.includes("..") || branch.includes("//")) return false;
   if (branch.includes("@{")) return false;
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: Git ref names reject ASCII control bytes.
   if (/[\s~^:?*[\\\]\x00-\x1f\x7f]/.test(branch)) return false;
   return branch
     .split("/")

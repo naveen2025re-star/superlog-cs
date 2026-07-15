@@ -257,10 +257,10 @@ export async function tryMergeAfterAgentRun(
     });
   } catch (err) {
     // Belt-and-suspenders for the TOCTOU race: the source or target can be
-    // resolved between candidate load and the merge transaction. The merge is
-    // atomic and its state assertion runs before any write, so a rejected merge
-    // leaves the run `running` — fall through to standalone completion instead
-    // of letting this surface as a `sync_failed`.
+    // resolved between candidate load and the merge transaction. The merge
+    // reloads both rows under lock; rejecting either participant rolls back the
+    // preceding run update and leaves the run `running`. Fall through to
+    // standalone completion instead of surfacing a `sync_failed`.
     if (err instanceof IllegalIncidentTransitionError) {
       logger.warn(
         {
@@ -296,6 +296,7 @@ async function applyMergeOutcome(opts: {
     sourceIncident: ctx.incident,
     targetIncident: target,
     evidence,
+    providerSessionIdToTerminate: sessionId,
   });
   // We deliberately do not relay a completed-investigation update for a merge
   // (the run didn't finish investigating a new problem). Instead we emit an
