@@ -660,6 +660,7 @@ export type GithubInstallation =
         accountLogin: string | null;
         accountType: string | null;
         enabled: boolean;
+        observabilityReviewEnabled: boolean;
         manageUrl: string;
         repos: { id: number; fullName: string; private: boolean; enabled: boolean }[];
       }[];
@@ -728,6 +729,7 @@ export function useUpdateGithubRepoAccess() {
     mutationFn: (body: {
       installationId: number;
       enabled?: boolean;
+      observabilityReviewEnabled?: boolean;
       repoId?: number;
       repoEnabled?: boolean;
     }) =>
