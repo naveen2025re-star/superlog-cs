@@ -16,13 +16,17 @@ import { Btn, Chip, FieldLabel, Input } from "../design/ui.tsx";
 import {
   type AuthDraft,
   EMPTY_AUTH,
+  type ProjectMcpAuthSelection,
   createDetectedProjectMcpAuthDraft,
   createProjectMcpEditorDraft,
   detectProjectMcpAuthSafely,
   projectMcpAuthDetectionIsCurrent,
+  projectMcpAuthDraftAfterUrlChange,
   projectMcpAuthSelectionAfterUrlChange,
+  resolveProjectMcpAuthForSubmit,
+  resolveSelectedScopes,
   shouldDetectProjectMcpAuth,
-  type ProjectMcpAuthSelection,
+  toggleScopeSelection,
 } from "./project-mcp-editor.ts";
 import { SettingsCard, SettingsRow } from "./rows.tsx";
 
@@ -46,6 +50,7 @@ export function AgentMcpServersCard({ projectId }: { projectId: string | undefin
   const [authDetection, setAuthDetection] = useState<string | null>(null);
   const [manualAuth, setManualAuth] = useState(false);
   const authSelection = useRef<ProjectMcpAuthSelection>("automatic");
+  const detectedAuthUrl = useRef<string | null>(null);
 
   const servers = query.data?.servers ?? [];
   const canManage = query.data?.canManage ?? false;
@@ -59,13 +64,11 @@ export function AgentMcpServersCard({ projectId }: { projectId: string | undefin
     connectClientCredentials.isPending ||
     disconnectOAuth.isPending;
 
-  const detectAuthForUrl = async (): Promise<AuthDraft | null> => {
+  const detectAuthForUrl = async (trustedValue = trusted): Promise<AuthDraft | null> => {
     const requestedUrl = urlRef.current;
-    if (!shouldDetectProjectMcpAuth(authSelection.current, requestedUrl, trusted)) return auth;
+    if (!shouldDetectProjectMcpAuth(authSelection.current, requestedUrl, trustedValue)) return auth;
     setAuthDetection("Detecting auth…");
-    const detected = await detectProjectMcpAuthSafely(() =>
-      detectAuth.mutateAsync(requestedUrl),
-    );
+    const detected = await detectProjectMcpAuthSafely(() => detectAuth.mutateAsync(requestedUrl));
     if (!projectMcpAuthDetectionIsCurrent(requestedUrl, urlRef.current)) return null;
     if (!detected) {
       setAuthDetection("Auth detection failed");
@@ -73,6 +76,7 @@ export function AgentMcpServersCard({ projectId }: { projectId: string | undefin
     }
     if (authSelection.current !== "automatic") return auth;
     const nextAuth = createDetectedProjectMcpAuthDraft(detected);
+    detectedAuthUrl.current = requestedUrl;
     setAuth(nextAuth);
     if (nextAuth.requiresClientId) {
       authSelection.current = "required";
@@ -94,8 +98,13 @@ export function AgentMcpServersCard({ projectId }: { projectId: string | undefin
     event.preventDefault();
     setError(null);
     if (!trusted) return;
-    const submittedAuth =
-      authSelection.current === "automatic" ? await detectAuthForUrl() : auth;
+    const submittedAuth = await resolveProjectMcpAuthForSubmit({
+      selection: authSelection.current,
+      draft: auth,
+      detectedUrl: detectedAuthUrl.current,
+      currentUrl: urlRef.current,
+      detect: detectAuthForUrl,
+    });
     if (!submittedAuth) return;
     create.mutate(
       {
@@ -111,6 +120,7 @@ export function AgentMcpServersCard({ projectId }: { projectId: string | undefin
           setUrl("");
           urlRef.current = "";
           setAuth(EMPTY_AUTH);
+          detectedAuthUrl.current = null;
           authSelection.current = "automatic";
           setManualAuth(false);
           setAuthDetection(null);
@@ -293,6 +303,8 @@ export function AgentMcpServersCard({ projectId }: { projectId: string | undefin
                   urlRef.current = e.target.value;
                   setUrl(e.target.value);
                   setAuthDetection(null);
+                  detectedAuthUrl.current = null;
+                  setAuth((current) => projectMcpAuthDraftAfterUrlChange(current));
                   const nextSelection = projectMcpAuthSelectionAfterUrlChange(
                     authSelection.current,
                   );
@@ -319,11 +331,13 @@ export function AgentMcpServersCard({ projectId }: { projectId: string | undefin
             onChange={setAuth}
             onConfigureManually={() => {
               authSelection.current = "manual";
+              detectedAuthUrl.current = null;
               setManualAuth(true);
               setAuthDetection(null);
             }}
             onUseAutomatic={() => {
               authSelection.current = "automatic";
+              detectedAuthUrl.current = null;
               setManualAuth(false);
               setAuth(EMPTY_AUTH);
               if (shouldDetectProjectMcpAuth("automatic", url, trusted)) void detectAuthForUrl();
@@ -333,7 +347,13 @@ export function AgentMcpServersCard({ projectId }: { projectId: string | undefin
             <input
               type="checkbox"
               checked={trusted}
-              onChange={(e) => setTrusted(e.target.checked)}
+              onChange={(event) => {
+                const nextTrusted = event.target.checked;
+                setTrusted(nextTrusted);
+                if (shouldDetectProjectMcpAuth(authSelection.current, url, nextTrusted)) {
+                  void detectAuthForUrl(nextTrusted);
+                }
+              }}
               className="mt-0.5"
             />
             <span>
@@ -415,6 +435,9 @@ export function McpAuthenticationEditor({
             Set auth manually
           </Btn>
         </div>
+      )}
+      {!manual && value.type === "oauth" && value.advertisedScopes.length > 0 && (
+        <OAuthScopesDisclosure value={value} onChange={onChange} />
       )}
     </div>
   );
@@ -583,18 +606,22 @@ function AuthFields({
           <option value="client_credentials">Client credentials</option>
         </select>
       </Field>
-      <Field label="Scopes (space-separated)">
-        <Input
-          value={value.scopes}
-          onChange={(e) => onChange({ ...value, scopes: e.target.value })}
-          placeholder="issues:read"
-        />
-      </Field>
+      {value.advertisedScopes.length > 0 ? (
+        <div className="sm:col-span-2">
+          <OAuthScopesDisclosure value={value} onChange={onChange} />
+        </div>
+      ) : (
+        <Field label="Scopes (space-separated)">
+          <Input
+            value={value.scopes}
+            onChange={(e) => onChange({ ...value, scopes: e.target.value })}
+            placeholder="issues:read"
+          />
+        </Field>
+      )}
       <Field
         label={
-          value.requiresClientId
-            ? "Client ID"
-            : "Client ID (optional with dynamic registration)"
+          value.requiresClientId ? "Client ID" : "Client ID (optional with dynamic registration)"
         }
       >
         <Input
@@ -617,6 +644,50 @@ function AuthFields({
         />
       </Field>
     </div>
+  );
+}
+
+export function OAuthScopesDisclosure({
+  value,
+  onChange,
+}: {
+  value: AuthDraft;
+  onChange: (next: AuthDraft) => void;
+}) {
+  const selectedScopes = resolveSelectedScopes(value.scopes, value.advertisedScopes);
+  const selected = new Set(selectedScopes);
+
+  return (
+    <details className="mt-3 rounded-md border border-border bg-surface-2 px-3 py-2 text-[12px]">
+      <summary className="cursor-pointer select-none text-fg">
+        OAuth scopes · {selectedScopes.length} selected
+      </summary>
+      <p className="mt-2 text-muted">
+        These scopes come from this MCP URL. Clear a scope to request less access.
+      </p>
+      <div className="mt-2 grid gap-2 sm:grid-cols-2">
+        {value.advertisedScopes.map((scope) => {
+          const checked = selected.has(scope);
+          return (
+            <label key={scope} className="flex items-start gap-2 font-mono text-[11.5px] text-fg">
+              <input
+                type="checkbox"
+                checked={checked}
+                disabled={checked && selectedScopes.length === 1}
+                onChange={() =>
+                  onChange({
+                    ...value,
+                    scopes: toggleScopeSelection(value.scopes, value.advertisedScopes, scope),
+                  })
+                }
+                className="mt-0.5"
+              />
+              <span className="break-all">{scope}</span>
+            </label>
+          );
+        })}
+      </div>
+    </details>
   );
 }
 
