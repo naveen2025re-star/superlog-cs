@@ -14,6 +14,7 @@ import {
   recordInboundInteraction,
   requestFollowUpAgentRun,
   restartAgentRun,
+  retryBlockedAgentRun,
 } from "./agent-follow-up.js";
 import type { DB } from "./client.js";
 import * as schema from "./schema.js";
@@ -1155,6 +1156,124 @@ test("restart serializes with follow-up creation and leaves one active successor
       runs.filter((run) => !["complete", "failed", "superseded"].includes(run.state)).length,
       1,
     );
+  } finally {
+    await client.close();
+  }
+});
+
+test("concurrent retries of a GitHub-blocked run create one viable successor", async () => {
+  const { db, client } = await freshFollowUpDb();
+  try {
+    const { incident, priorRun } = await seedFollowUpIncident(db);
+    await db
+      .update(schema.agentRuns)
+      .set({ createdAt: RECENT })
+      .where(eq(schema.agentRuns.id, priorRun.id));
+    const blocked = one(
+      await db
+        .insert(schema.agentRuns)
+        .values({
+          incidentId: incident.id,
+          runtime: "anthropic",
+          state: "blocked_no_github",
+          createdAt: NOW,
+        })
+        .returning(),
+    );
+
+    const results = await Promise.all([
+      retryBlockedAgentRun(db, { incidentId: incident.id, now: NOW }),
+      retryBlockedAgentRun(db, { incidentId: incident.id, now: NOW }),
+    ]);
+
+    assert.equal(results.filter((result) => result.outcome === "retried").length, 1);
+    assert.equal(results.filter((result) => result.outcome === "not_blocked").length, 1);
+    const runs = await db.query.agentRuns.findMany({
+      where: eq(schema.agentRuns.incidentId, incident.id),
+    });
+    assert.equal(runs.find((run) => run.id === blocked.id)?.state, "superseded");
+    const viable = runs.filter((run) => !["complete", "failed", "superseded"].includes(run.state));
+    assert.equal(viable.length, 1);
+    assert.equal(viable[0]?.state, "queued");
+    assert.equal(viable[0]?.runtime, "anthropic");
+  } finally {
+    await client.close();
+  }
+});
+
+test("retry preserves the blocked follow-up trigger context and prompt", async () => {
+  const { db, client } = await freshFollowUpDb();
+  try {
+    const { incident, priorRun } = await seedFollowUpIncident(db);
+    await db
+      .update(schema.agentRuns)
+      .set({ createdAt: RECENT })
+      .where(eq(schema.agentRuns.id, priorRun.id));
+    const triggerDetail = {
+      interactions: [
+        {
+          channel: "slack_reply" as const,
+          author: "alice",
+          text: "Please investigate the latest deploy.",
+          occurredAt: NOW.toISOString(),
+        },
+      ],
+      pullRequests: [],
+    };
+    await db.insert(schema.agentRuns).values({
+      incidentId: incident.id,
+      runtime: "anthropic",
+      state: "blocked_no_github",
+      trigger: "slack_reply",
+      triggerDetail,
+      prompt: "Focus on the authentication regression.",
+      createdAt: NOW,
+    });
+
+    const result = await retryBlockedAgentRun(db, { incidentId: incident.id, now: NOW });
+
+    assert.equal(result.outcome, "retried");
+    if (result.outcome !== "retried") return;
+    assert.equal(result.agentRun.trigger, "slack_reply");
+    assert.deepEqual(result.agentRun.triggerDetail, triggerDetail);
+    assert.equal(result.agentRun.prompt, "Focus on the authentication regression.");
+  } finally {
+    await client.close();
+  }
+});
+
+test("retry does not bypass disabled project agent runs", async () => {
+  const { db, client } = await freshFollowUpDb();
+  try {
+    const { incident, priorRun } = await seedFollowUpIncident(db);
+    await db
+      .update(schema.agentRuns)
+      .set({ createdAt: RECENT })
+      .where(eq(schema.agentRuns.id, priorRun.id));
+    const blocked = one(
+      await db
+        .insert(schema.agentRuns)
+        .values({
+          incidentId: incident.id,
+          runtime: "anthropic",
+          state: "blocked_no_github",
+          createdAt: NOW,
+        })
+        .returning(),
+    );
+    await db.insert(schema.projectAutomationSettings).values({
+      projectId: incident.projectId,
+      agentRunEnabled: false,
+    });
+
+    const result = await retryBlockedAgentRun(db, { incidentId: incident.id, now: NOW });
+
+    assert.deepEqual(result, { outcome: "agent_runs_disabled" });
+    const runs = await db.query.agentRuns.findMany({
+      where: eq(schema.agentRuns.incidentId, incident.id),
+    });
+    assert.equal(runs.find((run) => run.id === blocked.id)?.state, "blocked_no_github");
+    assert.equal(runs.length, 2);
   } finally {
     await client.close();
   }

@@ -37,6 +37,7 @@ type LockedAgentFollowUpAggregate = {
     state: schema.AgentRun["state"];
     trigger: AgentRunTrigger;
     triggerDetail: AgentRunTriggerDetail | null;
+    prompt: string | null;
     providerSessionId: string | null;
     completedAt: Date | null;
     runtime: string;
@@ -66,6 +67,7 @@ async function lockAgentFollowUpAggregate(
       state: schema.agentRuns.state,
       trigger: schema.agentRuns.trigger,
       triggerDetail: schema.agentRuns.triggerDetail,
+      prompt: schema.agentRuns.prompt,
       providerSessionId: schema.agentRuns.providerSessionId,
       completedAt: schema.agentRuns.completedAt,
       runtime: schema.agentRuns.runtime,
@@ -248,6 +250,13 @@ export type RestartAgentRunResult =
   | { outcome: "incident_not_open" }
   | { outcome: "no_prior_run" };
 
+export type RetryBlockedAgentRunResult =
+  | { outcome: "retried"; agentRun: schema.AgentRun }
+  | { outcome: "not_blocked" }
+  | { outcome: "agent_runs_disabled" }
+  | { outcome: "incident_not_open" }
+  | { outcome: "no_prior_run" };
+
 export async function restartAgentRun(
   db: DB,
   args: { incidentId: string; runtime: string; now?: Date },
@@ -260,89 +269,146 @@ export async function restartAgentRun(
     const latest = aggregate.runs[0];
     if (!latest) return { outcome: "no_prior_run" };
 
-    const superseded = await tx
-      .update(schema.agentRuns)
-      .set({ state: "superseded", completedAt: now, updatedAt: now })
-      .where(
-        and(
-          eq(schema.agentRuns.incidentId, args.incidentId),
-          inArray(schema.agentRuns.state, RESTARTABLE_AGENT_RUN_STATES),
-        ),
-      )
-      .returning({
-        id: schema.agentRuns.id,
-        providerSessionId: schema.agentRuns.providerSessionId,
-        providerSessionStatus: schema.agentRuns.providerSessionStatus,
-      });
-    const sessionsToTerminate = superseded.filter(
-      (run) => run.providerSessionId && run.providerSessionStatus !== "terminated",
-    );
-    if (sessionsToTerminate.length > 0) {
-      await tx
-        .update(schema.agentRuns)
-        .set({ providerSessionStatus: "termination_pending", updatedAt: now })
-        .where(
-          inArray(
-            schema.agentRuns.id,
-            sessionsToTerminate.map((run) => run.id),
-          ),
-        );
-    }
-    if (superseded.length > 0) {
-      await tx.insert(schema.incidentEvents).values(
-        superseded.map((run) => ({
-          incidentId: args.incidentId,
-          agentRunId: run.id,
-          kind: "agent_run_superseded",
-          summary: "Investigation superseded by a restart.",
-          dedupeKey: `superseded:${run.id}:${now.getTime()}`,
-          processedAt: now,
-        })),
-      );
-    }
-
-    const [created] = await tx
-      .insert(schema.agentRuns)
-      .values({
-        incidentId: args.incidentId,
-        runtime: args.runtime,
-        state: "queued",
-      })
-      .returning();
-    if (!created) throw new Error("failed to restart agent run");
-    if (superseded.length > 0) {
-      // A lifecycle delivery is deduped across the whole Incident. Keep its
-      // unprocessed input attached to the run that can still consume it;
-      // otherwise a webhook redelivery would correctly dedupe against an
-      // event stranded on a superseded predecessor and no run would act.
-      await tx
-        .update(schema.incidentEvents)
-        .set({ agentRunId: created.id })
-        .where(
-          and(
-            inArray(
-              schema.incidentEvents.agentRunId,
-              superseded.map((run) => run.id),
-            ),
-            inArray(schema.incidentEvents.kind, [...INBOUND_INTERACTION_EVENT_KINDS]),
-            isNull(schema.incidentEvents.processedAt),
-          ),
-        );
-    }
-    await tx.insert(schema.incidentEvents).values({
+    const created = await createRestartedAgentRun(tx, aggregate, {
       incidentId: args.incidentId,
-      agentRunId: created.id,
-      kind: "agent_run_restarted",
-      summary: "Investigation restarted.",
-      detail: {
-        restartedFromAgentRunId: latest.id,
-        restartedFromState: latest.state,
-      },
-      dedupeKey: `restart:${created.id}`,
-      processedAt: now,
+      runtime: args.runtime,
+      now,
     });
     return { outcome: "restarted", agentRun: created };
   });
+}
+
+export async function retryBlockedAgentRun(
+  db: DB,
+  args: { incidentId: string; now?: Date },
+): Promise<RetryBlockedAgentRunResult> {
+  const now = args.now ?? new Date();
+  return db.transaction(async (tx) => {
+    const aggregate = await lockAgentFollowUpAggregate(tx, args.incidentId);
+    if (!aggregate || aggregate.runs.length === 0) return { outcome: "no_prior_run" };
+    if (aggregate.incident.status !== "open") return { outcome: "incident_not_open" };
+    const latest = aggregate.runs[0];
+    if (!latest) return { outcome: "no_prior_run" };
+    if (latest.state !== "blocked_no_github") return { outcome: "not_blocked" };
+    const automation = await tx.query.projectAutomationSettings.findFirst({
+      where: eq(schema.projectAutomationSettings.projectId, aggregate.incident.projectId),
+      columns: { agentRunEnabled: true },
+    });
+    if (automation?.agentRunEnabled === false) return { outcome: "agent_runs_disabled" };
+
+    const created = await createRestartedAgentRun(tx, aggregate, {
+      incidentId: args.incidentId,
+      runtime: latest.runtime,
+      now,
+      preserveTriggerContext: true,
+    });
+    return { outcome: "retried", agentRun: created };
+  });
+}
+
+async function createRestartedAgentRun(
+  tx: AgentFollowUpTransaction,
+  aggregate: LockedAgentFollowUpAggregate,
+  args: {
+    incidentId: string;
+    runtime: string;
+    now: Date;
+    preserveTriggerContext?: boolean;
+  },
+): Promise<schema.AgentRun> {
+  const latest = aggregate.runs[0];
+  if (!latest) throw new Error("cannot restart an incident without an agent run");
+  const now = args.now;
+
+  const superseded = await tx
+    .update(schema.agentRuns)
+    .set({ state: "superseded", completedAt: now, updatedAt: now })
+    .where(
+      and(
+        eq(schema.agentRuns.incidentId, args.incidentId),
+        inArray(schema.agentRuns.state, RESTARTABLE_AGENT_RUN_STATES),
+      ),
+    )
+    .returning({
+      id: schema.agentRuns.id,
+      providerSessionId: schema.agentRuns.providerSessionId,
+      providerSessionStatus: schema.agentRuns.providerSessionStatus,
+    });
+  const sessionsToTerminate = superseded.filter(
+    (run) => run.providerSessionId && run.providerSessionStatus !== "terminated",
+  );
+  if (sessionsToTerminate.length > 0) {
+    await tx
+      .update(schema.agentRuns)
+      .set({ providerSessionStatus: "termination_pending", updatedAt: now })
+      .where(
+        inArray(
+          schema.agentRuns.id,
+          sessionsToTerminate.map((run) => run.id),
+        ),
+      );
+  }
+  if (superseded.length > 0) {
+    await tx.insert(schema.incidentEvents).values(
+      superseded.map((run) => ({
+        incidentId: args.incidentId,
+        agentRunId: run.id,
+        kind: "agent_run_superseded",
+        summary: "Investigation superseded by a restart.",
+        dedupeKey: `superseded:${run.id}:${now.getTime()}`,
+        processedAt: now,
+      })),
+    );
+  }
+
+  const [created] = await tx
+    .insert(schema.agentRuns)
+    .values({
+      incidentId: args.incidentId,
+      runtime: args.runtime,
+      state: "queued",
+      ...(args.preserveTriggerContext
+        ? {
+            trigger: latest.trigger,
+            triggerDetail: latest.triggerDetail,
+            prompt: latest.prompt,
+          }
+        : {}),
+    })
+    .returning();
+  if (!created) throw new Error("failed to restart agent run");
+  if (superseded.length > 0) {
+    // A lifecycle delivery is deduped across the whole Incident. Keep its
+    // unprocessed input attached to the run that can still consume it;
+    // otherwise a webhook redelivery would correctly dedupe against an
+    // event stranded on a superseded predecessor and no run would act.
+    await tx
+      .update(schema.incidentEvents)
+      .set({ agentRunId: created.id })
+      .where(
+        and(
+          inArray(
+            schema.incidentEvents.agentRunId,
+            superseded.map((run) => run.id),
+          ),
+          inArray(schema.incidentEvents.kind, [...INBOUND_INTERACTION_EVENT_KINDS]),
+          isNull(schema.incidentEvents.processedAt),
+        ),
+      );
+  }
+  await tx.insert(schema.incidentEvents).values({
+    incidentId: args.incidentId,
+    agentRunId: created.id,
+    kind: "agent_run_restarted",
+    summary: "Investigation restarted.",
+    detail: {
+      restartedFromAgentRunId: latest.id,
+      restartedFromState: latest.state,
+    },
+    dedupeKey: `restart:${created.id}`,
+    processedAt: now,
+  });
+  return created;
 }
 
 async function listOpenPullRequestContext(
