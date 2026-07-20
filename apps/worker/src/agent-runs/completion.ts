@@ -6,6 +6,7 @@ import {
   closeIncidentOpenPullRequestsAfterResolution,
   createIncidentLifecycle,
   db,
+  incidentHasCurrentSilencedIssues,
   isIncidentResolutionProofCurrent,
   resolveAgentIncident,
   schema,
@@ -477,11 +478,23 @@ export async function completeWithoutPullRequest(
 ): Promise<boolean> {
   const noiseReason = completedNoiseReason(result);
   const resolutionReason = noiseReason ? null : completedResolutionReason(result);
+  // The settled outcome only says which PR event triggered the resolve. Read
+  // whether the committed cascade actually silenced issues from the database:
+  // a close with a merged sibling resolves as agent_pr_merged with the plain
+  // resolve cascade, and must not render silenced copy or a no-op un-silence
+  // button.
+  const settledClosedSilenced =
+    opts?.incidentOutcome?.kind === "all_pull_requests_settled" &&
+    opts.incidentOutcome.settledState === "closed" &&
+    (await incidentHasCurrentSilencedIssues(ctx.incident.id));
   const mergedResolutionCopy =
     opts?.incidentOutcome?.kind === "all_pull_requests_merged"
       ? mergedPullRequestResolutionCopy(opts.incidentOutcome)
       : opts?.incidentOutcome?.kind === "all_pull_requests_settled"
-        ? settledPullRequestResolutionCopy(opts.incidentOutcome)
+        ? settledPullRequestResolutionCopy({
+            ...opts.incidentOutcome,
+            silenced: settledClosedSilenced,
+          })
         : null;
   const alreadyClosedCopy =
     opts?.incidentOutcome?.kind === "incident_already_closed"
@@ -759,7 +772,7 @@ export async function completeWithoutPullRequest(
               ? `Investigation complete · Linear ${ticket.identifier}`
               : "Investigation complete";
       const text = mergedResolutionCopy
-        ? `:white_check_mark: ${ctx.incident.title} — ${mergedResolutionCopy.mainTextSuffix}`
+        ? `:${settledClosedSilenced ? "no_bell" : "white_check_mark"}: ${ctx.incident.title} — ${mergedResolutionCopy.mainTextSuffix}`
         : noiseReason && noiseApplied
           ? `:no_bell: ${ctx.incident.title} — ${isAlertIncident(ctx) ? "Alert" : "Incident"} marked as noise`
           : resolutionReason
@@ -769,7 +782,8 @@ export async function completeWithoutPullRequest(
         ctx.incident.id,
         text,
         incidentBlocks({
-          emoji: noiseReason && noiseApplied ? "no_bell" : "white_check_mark",
+          emoji:
+            (noiseReason && noiseApplied) || settledClosedSilenced ? "no_bell" : "white_check_mark",
           status,
           title: ctx.incident.title,
           titleUrl: incidentUrl,
@@ -780,6 +794,7 @@ export async function completeWithoutPullRequest(
           links: ticket?.url ? [{ text: "View ticket", url: ticket.url }] : [],
           incidentId: ctx.incident.id,
           showFeedbackButtons: true,
+          showUnsilenceButton: settledClosedSilenced,
         }),
       );
     }

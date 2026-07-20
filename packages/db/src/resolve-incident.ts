@@ -687,8 +687,68 @@ export function createIncidentLifecycle(database: DB = db) {
       return resolveIfIncidentPullRequestsSatisfy(
         { incidentId: opts.incidentId, settlementEvidenceAt: opts.settlementEvidenceAt },
         areAllIncidentPullRequestsSettled,
-        opts.buildInput,
+        (pullRequests, epoch) => {
+          const input = opts.buildInput(pullRequests, epoch);
+          // A close without a merged sibling is the human declining the fix
+          // while the underlying errors may still be firing. Cascading
+          // `resolve` there re-arms recurrence, which re-investigates and
+          // re-delivers a PR the human just closed — so this path defaults
+          // the issue cascade to `silence` (recurrences suppressed) and the
+          // notification surface offers an explicit un-silence action.
+          if (input.kind === "agent_pr_closed" && !input.issueOutcome && !input.issueOutcomes) {
+            return { ...input, issueOutcome: { kind: "silence" } };
+          }
+          return input;
+        },
       );
+    },
+
+    // Whether any issue whose *current* incident is this one sits silenced.
+    // Drives the silenced variant of the resolution notification: derived
+    // from committed issue state (not the triggering PR event), and scoped to
+    // current links so an issue that recurred into a newer incident cannot
+    // resurface the silenced copy on a predecessor whose un-silence action
+    // could no longer touch it.
+    async hasCurrentSilencedIssues(incidentId: string): Promise<boolean> {
+      return repository.transaction(async (tx) => {
+        const issues = await repository.listCurrentIssuesForIncidentInTx(tx, incidentId);
+        return issues.some((issue) => issue.status === "silenced");
+      });
+    },
+
+    // Undo for the closed-PR silence default: flip this incident's silenced
+    // issues back to `resolved`, so the next occurrence is a recurrence that
+    // opens a chained incident again. Only issues whose *current* incident is
+    // this one are touched, mirroring the resolve cascade. Idempotent — a
+    // repeat click finds nothing silenced and reports zero.
+    async unsilenceIncidentIssues(opts: {
+      incidentId: string;
+      resolvedByUserId?: string;
+      resolvedBySlackUserId?: string;
+      now?: Date;
+    }): Promise<{ unsilencedIssueCount: number }> {
+      const now = opts.now ?? new Date();
+      return repository.transaction(async (tx) => {
+        const issues = await repository.listCurrentIssuesForIncidentInTx(tx, opts.incidentId);
+        const silenced = issues.filter((issue) => issue.status === "silenced");
+        for (const issue of silenced) {
+          await repository.updateIssueInTx(tx, issue.id, buildIssueResolvePatch());
+          await repository.insertEventInTx(tx, {
+            incidentId: opts.incidentId,
+            kind: "issue_unsilenced",
+            summary: `Issue un-silenced: ${issue.title}`,
+            detail: {
+              issueId: issue.id,
+              issueTitle: issue.title,
+              resolvedByUserId: opts.resolvedByUserId ?? null,
+              resolvedBySlackUserId: opts.resolvedBySlackUserId ?? null,
+            },
+            dedupeKey: `issue_unsilenced:${issue.id}:${now.getTime()}`,
+            processedAt: now,
+          });
+        }
+        return { unsilencedIssueCount: silenced.length };
+      });
     },
 
     async applyAgentRunResult(opts: {
@@ -1004,6 +1064,18 @@ export async function resolveIncidentIfAllAgentPullRequestsSettled(opts: {
   ): ResolveIncidentInput & { kind: "agent_pr_merged" | "agent_pr_closed" };
 }): Promise<ResolveIncidentAfterAgentPullRequestsMergedResult> {
   return createIncidentLifecycle(db).resolveIfAllAgentPullRequestsSettled(opts);
+}
+
+export async function incidentHasCurrentSilencedIssues(incidentId: string): Promise<boolean> {
+  return createIncidentLifecycle(db).hasCurrentSilencedIssues(incidentId);
+}
+
+export async function unsilenceIncidentIssues(opts: {
+  incidentId: string;
+  resolvedByUserId?: string;
+  resolvedBySlackUserId?: string;
+}): Promise<{ unsilencedIssueCount: number }> {
+  return createIncidentLifecycle(db).unsilenceIncidentIssues(opts);
 }
 
 // Body of the resolve operation, parameterised on a transaction handle.

@@ -311,6 +311,8 @@ export {
   resolveIncidentWithProof,
   resolveIncidentIfAllAgentPullRequestsMerged,
   resolveIncidentIfAllAgentPullRequestsSettled,
+  incidentHasCurrentSilencedIssues,
+  unsilenceIncidentIssues,
   reconcileAgentRunCompletedByResolution,
   validateIncidentIssueOutcomes,
   reserveAgentPullRequestBatch,
