@@ -1,7 +1,7 @@
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import GridLayout, { type Layout, type LayoutItem, useContainerWidth } from "react-grid-layout";
 import { verticalCompactor } from "react-grid-layout";
-import type { ExploreRange } from "../api.ts";
+import { type ExploreRange, useCloudConnections } from "../api.ts";
 import {
   RANGE_PRESETS,
   RangePicker,
@@ -46,6 +46,7 @@ export function HomeDashboard({
   slugs: ProjectRouteSlugs;
 }) {
   const home = useHomeDashboard(projectId);
+  const cloudConnections = useCloudConnections(projectId);
   const setBuiltin = useSetHomeBuiltin(projectId);
   const updateLayout = useUpdateHomeLayout(projectId);
   const remove = useDeleteHomeItem(projectId);
@@ -67,6 +68,19 @@ export function HomeDashboard({
     .map((widget) => widget.type)
     .filter((type): type is HomeBuiltinType => BUILTIN_TYPES.has(type as HomeBuiltinType));
   const { setup, grid } = splitHomeWidgets(home.data.widgets);
+  // Hide the service map tile for projects that have no cloud connection — without
+  // one there's no map and nothing to build, so the widget is pure clutter. Only
+  // hide once the connections query has actually resolved to an empty list: while
+  // it's still loading or if it errored, keep the tile so a connected project's map
+  // doesn't flicker away (or stay hidden on a transient failure). Also keep it while
+  // customizing so it stays draggable/removable.
+  const hideServiceMap =
+    cloudConnections.isSuccess &&
+    (cloudConnections.data?.length ?? 0) === 0 &&
+    !customizing;
+  const visibleGrid = grid.filter(
+    (widget) => widget.type !== "service_map" || !hideServiceMap,
+  );
 
   return (
     <div className="flex flex-col gap-6">
@@ -99,12 +113,12 @@ export function HomeDashboard({
             Add your first widget
           </Btn>
         </div>
-      ) : grid.length > 0 ? (
+      ) : visibleGrid.length > 0 ? (
         <HomeGrid
           projectId={projectId}
           slugs={slugs}
           range={range}
-          widgets={grid}
+          widgets={visibleGrid}
           customizing={customizing}
           onRemove={(widget) => {
             if (confirm(`Remove “${widget.title}” from home?`)) remove.mutate(widget.id);
