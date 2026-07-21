@@ -216,6 +216,13 @@ export type AgentRunnerSnapshot = {
       url: string | null;
     }>;
   } | null;
+  // The provider gave up retrying the current turn while keeping the session
+  // resumable. Orchestration can refresh repository credentials and continue
+  // in place without discarding the investigation context.
+  recoverableFailure?: {
+    kind: "provider_retries_exhausted";
+    providerEventId: string;
+  } | null;
   // Custom tools the runtime had no handler for. The collector ack's them
   // with an error result so the session can leave requires_action; sync.ts
   // then fails the run with `unknown_custom_tool` so we can audit them later.
@@ -295,6 +302,19 @@ export type AgentRunnerBackend = {
   collect(sessionId: string): Promise<AgentRunnerSnapshot>;
   resume(sessionId: string, message: string): Promise<void>;
   steer(sessionId: string, message: string): Promise<void>;
+  // Recover a resumable provider turn in place. The backend owns its resource
+  // model; the application supplies fresh credentials only for repositories
+  // the provider says are attached to this session.
+  recover?(
+    sessionId: string,
+    input: {
+      continuationMessage: string;
+      authorizeRepository(fullName: string): Promise<string>;
+      // Call and await this after resource refresh succeeds, immediately
+      // before attempting the externally delivered continuation message.
+      markContinuationAttempted(): Promise<void>;
+    },
+  ): Promise<void>;
   // Optional: classify a resume/steer delivery failure so the caller can
   // repair a wedged turn in place instead of discarding a live session.
   classifyDeliveryError?(err: unknown): SessionDeliveryErrorKind;

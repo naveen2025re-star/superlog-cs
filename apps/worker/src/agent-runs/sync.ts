@@ -16,12 +16,14 @@ import {
 import { and, asc, desc, eq, inArray, isNull } from "drizzle-orm";
 import { TERMINAL_OUTCOME_NUDGE_MARKER, assembleAgentRunResult } from "../agent-outcome-tools.js";
 import type { AgentRunContext } from "../agent-run-context.js";
+import { listAccessibleGithubRepositories } from "../agent-run-context.js";
 import { type PauseForEventsOutcome, createAgentRunLifecycle } from "../agent-run.js";
 import type { AgentRunnerSnapshot } from "../agent-runner-backend.js";
 import { type AgentRunOutcome, recordAgentRunCompletion } from "../ai-usage.js";
 import { investigationGate } from "../billing/investigation-gate.js";
 import { usageNotifier } from "../billing/usage-notifier-infra.js";
 import { getAgentRunnerBackend } from "../infra/agent-runner/backend.js";
+import { createRepositoryReadToken } from "../infra/github/repositories.js";
 import { postIncidentThreadMessage } from "../infra/slack/incident-messages.js";
 import { type ResolvedIntegration, loadEnabledIntegrationsForOrg } from "../integrations.js";
 import { logger } from "../logger.js";
@@ -40,6 +42,7 @@ import {
   reconcileDeliveredPullRequests,
   selectDeliveredPullRequestsForOutcome,
 } from "./pr-result-reconciliation.js";
+import { reclaimStaleRecoveryClaim, recoverExhaustedRunnerTurn } from "./recovery.js";
 import { supersededSnapshotCompletionResult } from "./resolution-completion.js";
 import {
   awaitingHumanSecondsFromEvents,
@@ -682,6 +685,104 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
           columns: { id: true },
         }));
         await meterAgentRun(hasPr ? "complete_with_pr" : "complete_no_pr", hasPr);
+      }
+      return;
+    }
+
+    if (!snapshot.result && snapshot.recoverableFailure) {
+      try {
+        const recovery = await recoverExhaustedRunnerTurn({
+          sessionId,
+          failure: snapshot.recoverableFailure,
+          runner,
+          listRepositories: async () =>
+            (await listAccessibleGithubRepositories(ctx)).map((repository) => ({
+              fullName: repository.fullName,
+              id: repository.id,
+              installationId: repository.installation.installationId,
+            })),
+          createRepositoryReadToken,
+          claimRecovery: async (providerEventId) => {
+            const recoveryEventId = `session_recovery:${providerEventId}`;
+            const insertClaim = () =>
+              db
+                .insert(schema.incidentEvents)
+                .values({
+                  agentRunId: ctx.agentRun.id,
+                  kind: "session_recovery",
+                  summary:
+                    "Refreshing repository access and continuing after the managed service exhausted its retries.",
+                  providerEventId: recoveryEventId,
+                })
+                .onConflictDoNothing()
+                .returning({ id: schema.incidentEvents.id });
+            const inserted = await insertClaim();
+            if (inserted[0]) return inserted[0];
+
+            // An unprocessed claim is a lease, not a permanent lock. If its
+            // owner crashed (or failed to delete it after a recovery error),
+            // a later sync pass may reclaim it. Completed claims retain
+            // processed_at and continue to deduplicate the provider event.
+            const staleClaim = await db.query.incidentEvents.findFirst({
+              where: and(
+                eq(schema.incidentEvents.agentRunId, ctx.agentRun.id),
+                eq(schema.incidentEvents.providerEventId, recoveryEventId),
+              ),
+              columns: { id: true, createdAt: true, processedAt: true },
+            });
+            if (!staleClaim) return null;
+            return reclaimStaleRecoveryClaim({
+              staleClaim,
+              now: new Date(),
+              deleteIfStillUnprocessed: async (id) => {
+                const deleted = await db
+                  .delete(schema.incidentEvents)
+                  .where(
+                    and(
+                      eq(schema.incidentEvents.id, id),
+                      isNull(schema.incidentEvents.processedAt),
+                    ),
+                  )
+                  .returning({ id: schema.incidentEvents.id });
+                return !!deleted[0];
+              },
+              insertReplacement: async () => (await insertClaim())[0] ?? null,
+            });
+          },
+          releaseRecoveryClaim: async (id) => {
+            await db
+              .delete(schema.incidentEvents)
+              .where(
+                and(eq(schema.incidentEvents.id, id), isNull(schema.incidentEvents.processedAt)),
+              );
+          },
+          completeRecoveryClaim: async (id) => {
+            await db
+              .update(schema.incidentEvents)
+              .set({ processedAt: new Date() })
+              .where(eq(schema.incidentEvents.id, id));
+          },
+        });
+        logger.info(
+          {
+            agent_run_id: ctx.agentRun.id,
+            incident_id: ctx.incident.id,
+            provider_session_id: sessionId,
+            provider_event_id: snapshot.recoverableFailure.providerEventId,
+            recovery,
+          },
+          "handled exhausted managed-agent turn",
+        );
+      } catch (err) {
+        logger.warn(
+          {
+            err,
+            agent_run_id: ctx.agentRun.id,
+            incident_id: ctx.incident.id,
+            provider_session_id: sessionId,
+          },
+          "managed-agent turn recovery failed; leaving it retryable",
+        );
       }
       return;
     }
