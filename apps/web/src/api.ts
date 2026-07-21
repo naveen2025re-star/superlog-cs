@@ -1612,6 +1612,57 @@ export function useUninstallNotion() {
   });
 }
 
+export type SentryInstallation =
+  | { installed: false }
+  | {
+      installed: true;
+      organizationSlug: string;
+      projectSlug: string;
+      needsReauth: boolean;
+      reauthReason: string | null;
+    };
+
+export function sentryProjectEndpoints(projectId: string) {
+  const base = `/api/projects/${projectId}/sentry`;
+  return {
+    installation: `${base}/installation`,
+    installUrl: `${base}/install-url`,
+    uninstall: `${base}/uninstall`,
+  };
+}
+
+export function useSentryInstallation(projectId: string | undefined) {
+  const fetcher = useFetcher();
+  return useQuery({
+    queryKey: ["sentry-installation", projectId],
+    queryFn: () =>
+      fetcher<SentryInstallation>(sentryProjectEndpoints(projectId!).installation),
+    enabled: !!projectId,
+  });
+}
+
+export function useStartSentryInstall(projectId: string | undefined) {
+  const fetcher = useFetcher();
+  return useMutation({
+    mutationFn: (projectSlug: string) =>
+      fetcher<{ url: string }>(sentryProjectEndpoints(projectId!).installUrl, {
+        method: "POST",
+        body: JSON.stringify({ projectSlug }),
+      }),
+  });
+}
+
+export function useUninstallSentry(projectId: string | undefined) {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      fetcher<{ ok: true }>(sentryProjectEndpoints(projectId!).uninstall, { method: "POST" }),
+    onSuccess: () =>
+      qc.invalidateQueries({ queryKey: ["sentry-installation", projectId] }),
+  });
+}
+
 export type OrgProject = { id: string; name: string; slug: string; projectContext: string };
 
 export function useOrgProjects() {
