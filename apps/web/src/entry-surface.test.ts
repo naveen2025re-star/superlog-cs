@@ -27,6 +27,7 @@ test("marketing and product URLs boot independent client surfaces", () => {
     "/signup",
     "/forgot-password",
     "/reset-password",
+    "/settings",
     "/connect/vercel",
     "/feedback/pr/acme/repo/1",
     "/design",
@@ -38,4 +39,10 @@ test("marketing and product URLs boot independent client surfaces", () => {
 test("the legacy GitHub installation callback still boots the product surface", () => {
   assert.equal(surfaceForPath("/", "?installation_id=123&state=signed"), "product");
   assert.equal(surfaceForPath("/", "?installation_id=123"), "marketing");
+});
+
+test("legacy root OAuth callback markers still boot the product surface", () => {
+  for (const search of ["?gh=done", "?gh=error", "?slack=installed", "?slack=error"]) {
+    assert.equal(surfaceForPath("/", search), "product", search);
+  }
 });

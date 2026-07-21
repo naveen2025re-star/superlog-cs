@@ -148,7 +148,7 @@ export function mountGithubPublic(
     const mgmt = verifyMgmtState(state, stateSecret);
     if (mgmt) {
       const callbackWebOrigin = resolveCallbackWebOrigin(c, webOrigin);
-      const failTarget = mgmt.returnUrl ?? `${callbackWebOrigin}/`;
+      const failTarget = mgmt.returnUrl ?? buildAppWebUrl(callbackWebOrigin);
       if (!Number.isFinite(installationId) || installationId <= 0) {
         return c.redirect(`${failTarget}${failTarget.includes("?") ? "&" : "?"}gh=error`, 302);
       }
@@ -183,7 +183,7 @@ export function mountGithubPublic(
         clientSecret: oauthClientSecret,
         redirectUrl: installRedirectUrl,
       });
-      const successTarget = mgmt.returnUrl ?? `${callbackWebOrigin}/`;
+      const successTarget = mgmt.returnUrl ?? buildAppWebUrl(callbackWebOrigin);
       return c.redirect(
         `${successTarget}${successTarget.includes("?") ? "&" : "?"}gh=${marker}`,
         302,
@@ -204,7 +204,7 @@ export function mountGithubPublic(
         })))
     ) {
       const callbackWebOrigin = resolveCallbackWebOrigin(c, webOrigin);
-      return c.redirect(`${callbackWebOrigin}/?gh=error`, 302);
+      return c.redirect(buildAppWebUrl(callbackWebOrigin, "?gh=error"), 302);
     }
 
     // "cli" kind: value is userCode → resolve org+project from device.
@@ -260,7 +260,7 @@ export function mountGithubPublic(
     // decoded.kind === "web" — value resolved to project above.
     const callbackWebOrigin = resolveCallbackWebOrigin(c, webOrigin);
     if (!Number.isFinite(installationId) || installationId <= 0 || !orgId || !projectId) {
-      return c.redirect(`${callbackWebOrigin}/?gh=error`, 302);
+      return c.redirect(buildAppWebUrl(callbackWebOrigin, "?gh=error"), 302);
     }
     const rowId = await upsertInstallation({ orgId, projectId, installationId });
     await resumeBlockedAgentRunsForProjects([projectId], "github_install");
@@ -272,7 +272,7 @@ export function mountGithubPublic(
       clientSecret: oauthClientSecret,
       redirectUrl: installRedirectUrl,
     });
-    return c.redirect(`${callbackWebOrigin}/?gh=${marker}`, 302);
+    return c.redirect(buildAppWebUrl(callbackWebOrigin, `?gh=${marker}`), 302);
   });
 
   app.post("/github/webhook", async (c) => {
