@@ -55,7 +55,6 @@ import { shouldRunMigrationsOnBoot } from "./boot-migrations.js";
 import { mountCloudConnectionsAuthed } from "./cloud-connections.js";
 import { mountCloudflareAuthed, mountCloudflarePublic } from "./cloudflare.js";
 import { mountDashboards } from "./dashboards.js";
-import { mountSavedViews } from "./saved-views/interfaces.js";
 import {
   demoOverlay,
   demoProjectId,
@@ -138,7 +137,15 @@ import {
 import { mountProjectRouteContext } from "./project-route-context.js";
 import { mountRailwayAuthed, mountRailwayPublic } from "./railway.js";
 import { mountRenderAuthed } from "./render.js";
+import {
+  type ActorAuditDeps,
+  createAuthActorAuditMiddleware,
+  isAuditableMutation,
+  statusFromThrown,
+  writeActorAuditLog,
+} from "./request-actor-log.js";
 import { mountApiRequestSecurity, requestBodyLimit } from "./request-body-limits.js";
+import { mountSavedViews } from "./saved-views/interfaces.js";
 import { mountSettingsAuthed } from "./settings.js";
 import { normalizeSignupIntentKeyHash, normalizeSignupIntentKeyPrefix } from "./signup-intents.js";
 import { mountSlackAuthed, mountSlackPublic } from "./slack.js";
@@ -304,6 +311,28 @@ app.post("/api/signup-intents", async (c) => {
   });
 });
 
+// Shared dependencies for the actor audit log — attributes every mutating API
+// request to a named user + org so failures can be traced back to who did what.
+const actorAuditDeps: ActorAuditDeps = {
+  getSession: (headers) => auth.api.getSession({ headers }),
+  resolveOrg: (orgId) =>
+    db.query.orgs
+      .findFirst({
+        where: eq(schema.orgs.id, orgId),
+        columns: { name: true, slug: true },
+      })
+      .then((org) => org ?? null),
+  log: (fields) => logger.info(fields, "api actor"),
+  onError: (err, path) => logger.warn({ err, path }, "failed to write actor audit log"),
+};
+
+// Better Auth handles its own routes under /api/auth/* and terminates the
+// request itself, so the session middleware below never runs for them. This
+// attributes the mutating ones (org/member/api-key changes) instead, stamping
+// identity onto the observability span and audit-logging after. Must stay
+// registered before the handler mount.
+app.use("/api/auth/*", createAuthActorAuditMiddleware(actorAuditDeps));
+
 // Better Auth handles its own routes under /api/auth/*. Mount before the
 // session middleware so sign-in/sign-up/oauth-callback endpoints don't trip
 // the unauthenticated guard.
@@ -330,12 +359,15 @@ mountManagementApi(app, { ch });
 mountProjectMcpServersManagement(app);
 
 app.use("/api/*", async (c, next) => {
-  if (c.req.path.startsWith("/api/v1/")) return next();
-  if (c.req.path.startsWith("/api/auth/")) return next();
-  if (c.req.path === "/api/auth-providers") return next();
+  const path = c.req.path;
+  if (path.startsWith("/api/v1/")) return next();
+  // /api/auth/* is handled (and attributed) by the middleware + mount above,
+  // which terminate the request before this ever runs.
+  if (path.startsWith("/api/auth/")) return next();
+  if (path === "/api/auth-providers") return next();
   // Zero-paste AWS-connect callback: no session — authenticated by the
   // connection's external ID inside the body (see cloud-connections.ts).
-  if (c.req.path === "/api/cloud-connections/callback") return next();
+  if (path === "/api/cloud-connections/callback") return next();
   const session = await auth.api.getSession({ headers: c.req.raw.headers });
   if (!session) return c.json({ error: "unauthenticated" }, 401);
   c.set("userId", session.user.id);
@@ -345,7 +377,19 @@ app.use("/api/*", async (c, next) => {
   // admin is acting as another user; surface it on `c.var` so /api/me can
   // expose a boolean without the web client having to inspect raw session.
   c.set("impersonating", typeof session.session.impersonatedBy === "string");
-  await next();
+  if (!isAuditableMutation({ method: c.req.method, path })) return next();
+  // Audit in a finally so writes that fail by throwing an HTTPException (e.g.
+  // invalid input) are attributed too, not just those returning an error body.
+  let status = 500;
+  try {
+    await next();
+    status = c.res.status;
+  } catch (err) {
+    status = statusFromThrown(err);
+    throw err;
+  } finally {
+    await writeActorAuditLog(actorAuditDeps, session, c.req.method, path, status);
+  }
 });
 
 // Demo overlay (framework level): decides demo-vs-real per request, enforces
