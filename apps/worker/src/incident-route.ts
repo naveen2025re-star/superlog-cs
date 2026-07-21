@@ -6,7 +6,7 @@ export type IncidentRoute = {
 
 export function buildIncidentUrl(webOrigin: string, route: IncidentRoute): string {
   const origin = webOrigin.replace(/\/$/, "");
-  return `${origin}/org/${encodeURIComponent(route.orgSlug)}/project/${encodeURIComponent(route.projectSlug)}/incidents/${encodeURIComponent(route.incidentId)}`;
+  return `${origin}/app/org/${encodeURIComponent(route.orgSlug)}/project/${encodeURIComponent(route.projectSlug)}/incidents/${encodeURIComponent(route.incidentId)}`;
 }
 
 export function buildContextIncidentUrl(

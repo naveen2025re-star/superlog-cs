@@ -10,16 +10,18 @@ export type ProjectRouteLocation = {
 };
 
 export function buildProjectPath(slugs: ProjectRouteSlugs, appPath: string): string {
-  const root = `/org/${encodeURIComponent(slugs.orgSlug)}/project/${encodeURIComponent(slugs.projectSlug)}`;
+  const root = `/app/org/${encodeURIComponent(slugs.orgSlug)}/project/${encodeURIComponent(slugs.projectSlug)}`;
   if (appPath === "/" || appPath === "") return root;
   const suffix = appPath.startsWith("/") ? appPath : `/${appPath}`;
   return `${root}${suffix}`;
 }
 
 export function appPathFromProjectRoute(pathname: string): string {
-  const match = /^\/org\/[^/]+\/project\/[^/]+(?<appPath>\/.*)?$/.exec(pathname);
-  if (!match) return pathname;
-  return match.groups?.appPath || "/";
+  const match = /^\/(?:app\/)?org\/[^/]+\/project\/[^/]+(?<appPath>\/.*)?$/.exec(pathname);
+  if (match) return match.groups?.appPath || "/";
+  if (pathname === "/app" || pathname === "/app/") return "/";
+  if (pathname.startsWith("/app/")) return pathname.slice(4);
+  return pathname;
 }
 
 export function canonicalProjectLocation(
