@@ -53,7 +53,80 @@ export function useHomeDashboard(projectId: string | undefined) {
   });
 }
 
-export type HomeBuiltinType = "setup_todos" | "active_incidents" | "service_map";
+export type AgentPullRequestSummary = {
+  window: "30d";
+  total: number;
+  merged: number;
+  unmerged: number;
+  open: number;
+  closed: number;
+};
+
+export function useAgentPullRequestSummary(projectId: string | undefined) {
+  const fetcher = useFetcher();
+  return useQuery({
+    queryKey: ["home-pull-request-summary", projectId],
+    queryFn: () =>
+      fetcher<AgentPullRequestSummary>(`/api/projects/${projectId}/home/pull-request-summary`),
+    enabled: !!projectId,
+    staleTime: 60_000,
+  });
+}
+
+export type HomeIncidentTrend = {
+  active: number;
+  rows: Array<{
+    day: string;
+    label: string;
+    sev1: number;
+    sev2: number;
+    sev3: number;
+    untriaged: number;
+  }>;
+};
+
+export function useHomeIncidentTrend(projectId: string | undefined) {
+  const fetcher = useFetcher();
+  return useQuery({
+    queryKey: ["home-incident-trend", projectId],
+    queryFn: () => fetcher<HomeIncidentTrend>(`/api/projects/${projectId}/home/incident-trend`),
+    enabled: !!projectId,
+    staleTime: 30_000,
+  });
+}
+
+export type HomeSignalSeries = {
+  step: string;
+  rows: Array<{
+    bucket: string;
+    traces: number;
+    logs: number;
+    metrics: number;
+  }>;
+};
+
+export function useHomeSignalSeries(
+  projectId: string | undefined,
+  range: { since: string; until: string },
+) {
+  const fetcher = useFetcher();
+  const query = new URLSearchParams({ since: range.since, until: range.until });
+  return useQuery({
+    queryKey: ["home-signal-series", projectId, range.since, range.until],
+    queryFn: () =>
+      fetcher<HomeSignalSeries>(`/api/projects/${projectId}/home/signal-series?${query}`),
+    enabled: !!projectId,
+    staleTime: 30_000,
+  });
+}
+
+export type HomeBuiltinType =
+  | "setup_todos"
+  | "active_incidents"
+  | "service_map"
+  | "incoming_signals"
+  | "incident_count"
+  | "agent_pull_requests";
 
 export function useSetHomeBuiltin(projectId: string) {
   const fetcher = useFetcher();

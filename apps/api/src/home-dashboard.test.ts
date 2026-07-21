@@ -4,22 +4,35 @@ import { test } from "node:test";
 process.env.DATABASE_URL ??= "postgres://localhost:5434/superlog";
 
 const {
+  HOME_BUILTIN_TYPES,
   defaultHomeWidgets,
+  homeBuiltinDefinition,
   homeLinkCreateSchema,
   dashboardRouteCanMutateDashboard,
   dashboardRouteCanWriteWidget,
 } = await import("./dashboards-service.js");
 
-test("a new project home preserves the three existing overview sections as widgets", () => {
+test("every customizable home built-in keeps a definition even when it is not a default", () => {
+  assert.deepEqual(
+    HOME_BUILTIN_TYPES.map((type) => homeBuiltinDefinition(type).type),
+    HOME_BUILTIN_TYPES,
+  );
+});
+
+test("a new project home starts with the three operational pulse widgets", () => {
   const widgets = defaultHomeWidgets();
 
   assert.deepEqual(
     widgets.map((widget) => widget.type),
-    ["setup_todos", "active_incidents", "service_map"],
+    ["setup_todos", "incoming_signals", "incident_count", "agent_pull_requests"],
   );
-  assert.equal(
-    widgets.every((widget) => (widget.layout?.w ?? 0) >= 6),
-    true,
+  assert.deepEqual(
+    widgets.slice(1).map((widget) => widget.layout),
+    [
+      { x: 0, y: 5, w: 4, h: 5 },
+      { x: 4, y: 5, w: 4, h: 5 },
+      { x: 8, y: 5, w: 4, h: 5 },
+    ],
   );
 });
 
