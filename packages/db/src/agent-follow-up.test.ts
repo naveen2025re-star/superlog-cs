@@ -13,6 +13,7 @@ import {
   evaluateFollowUpEligibility,
   recordInboundInteraction,
   requestFollowUpAgentRun,
+  requestOpenPrAgentRun,
   restartAgentRun,
   retryBlockedAgentRun,
 } from "./agent-follow-up.js";
@@ -580,6 +581,105 @@ test("direct follow-up requests do not enqueue or append after Incident resoluti
 
   assert.deepEqual(result, { outcome: "skipped", reason: "incident_not_open" });
   assert.deepEqual(writes, []);
+});
+
+test("an explicit Open a PR request queues a fresh run with remediation instructions", async () => {
+  const { db, client } = await freshFollowUpDb();
+  try {
+    const { incident } = await seedFollowUpIncident(db);
+    await db.insert(schema.projectAutomationSettings).values({
+      projectId: incident.projectId,
+      autoFollowUpEnabled: false,
+      prPolicy: "never",
+    });
+
+    const result = await requestOpenPrAgentRun(db, {
+      incidentId: incident.id,
+      requestedBy: "U123",
+      requestId: "U123:1712345.6789",
+      now: NOW,
+    });
+
+    assert.equal(result.outcome, "enqueued");
+    if (result.outcome !== "enqueued") return;
+    const run = await db.query.agentRuns.findFirst({
+      where: eq(schema.agentRuns.id, result.agentRunId),
+    });
+    assert.equal(run?.trigger, "slack_open_pr");
+    assert.deepEqual(run?.triggerDetail?.interactions, [
+      {
+        channel: "slack_open_pr",
+        author: "U123",
+        text: "Fix the confirmed incident cause and open a pull request with the validated changes.",
+        occurredAt: NOW.toISOString(),
+      },
+    ]);
+  } finally {
+    await client.close();
+  }
+});
+
+test("an Open a PR request upgrades an already-queued follow-up to PR capability", async () => {
+  const { db, client } = await freshFollowUpDb();
+  try {
+    const { incident } = await seedFollowUpIncident(db);
+    const queued = await requestFollowUpAgentRun(db, {
+      incidentId: incident.id,
+      trigger: "slack_reply",
+      interaction: {
+        channel: "slack_reply",
+        author: "U123",
+        text: "Please keep investigating.",
+        occurredAt: NOW.toISOString(),
+      },
+      now: NOW,
+    });
+    assert.equal(queued.outcome, "enqueued");
+
+    const result = await requestOpenPrAgentRun(db, {
+      incidentId: incident.id,
+      requestedBy: "U456",
+      requestId: "U456:1712346.6789",
+      now: new Date(NOW.getTime() + 1_000),
+    });
+
+    assert.equal(result.outcome, "appended");
+    if (result.outcome !== "appended") return;
+    const run = await db.query.agentRuns.findFirst({
+      where: eq(schema.agentRuns.id, result.agentRunId),
+    });
+    assert.equal(run?.trigger, "slack_open_pr");
+    assert.equal(run?.triggerDetail?.interactions.length, 2);
+  } finally {
+    await client.close();
+  }
+});
+
+test("Open a PR requests deduplicate Slack retries before enqueue side effects", async () => {
+  const { db, client } = await freshFollowUpDb();
+  try {
+    const { incident } = await seedFollowUpIncident(db);
+    const args = {
+      incidentId: incident.id,
+      requestedBy: "U123",
+      requestId: "U123:1712345.6789",
+      now: NOW,
+    };
+
+    const first = await requestOpenPrAgentRun(db, args);
+    const retry = await requestOpenPrAgentRun(db, args);
+
+    assert.equal(first.outcome, "enqueued");
+    assert.deepEqual(retry, { outcome: "duplicate" });
+    const runs = await db.query.agentRuns.findMany({
+      where: eq(schema.agentRuns.incidentId, incident.id),
+    });
+    assert.equal(runs.filter((run) => run.trigger === "slack_open_pr").length, 1);
+    const openPrRun = runs.find((run) => run.trigger === "slack_open_pr");
+    assert.equal(openPrRun?.triggerDetail?.interactions.length, 1);
+  } finally {
+    await client.close();
+  }
 });
 
 test("a newly-enqueued follow-up carries every currently-open Incident PR", async () => {
