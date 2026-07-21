@@ -15,7 +15,13 @@ export type Me = {
   // Both null when the user signed up but hasn't created their first org yet.
   // The onboarding wizard's create-org step posts to /api/me/orgs to fix that.
   org: { id: string; name: string; slug: string; githubSetupNeeded: boolean } | null;
-  project: { id: string; name: string; slug: string; hasIngested: boolean } | null;
+  project: {
+    id: string;
+    name: string;
+    slug: string;
+    hasIngested: boolean;
+    hasSentryIssues: boolean;
+  } | null;
   // True when a shared demo project is configured and this project hasn't
   // ingested yet — the server is serving it read-only sample data. Drives the
   // demo-explore experience + the persistent install nudge. Flips false the
@@ -77,6 +83,7 @@ export type SystemCapabilities = {
   railwayConnect: boolean;
   renderConnect: boolean;
   gcpConnect: boolean;
+  sentryConnect: boolean;
 };
 
 const SIGNUP_SOURCE_STORAGE_KEY = "superlog.signup_source";
@@ -133,13 +140,13 @@ export function useMe() {
       clearPendingSignupSource();
       return me;
     },
-    // Poll while the active project hasn't ingested yet, then stop. This is what
-    // makes the onboarding gate teleport off the install wizard / demo data the
-    // instant real telemetry lands (hasIngested is derived from the proxy's
-    // project-level acceptance marker), and the onboarding flows key their
-    // "first events" state off the same field. Post-ingest (the common case)
-    // there's no polling.
-    refetchInterval: (query) => (query.state.data?.project?.hasIngested ? false : 10_000),
+    // Poll while the active project has neither telemetry nor a Sentry issue.
+    // Either project-level marker completes web onboarding without a per-page
+    // ClickHouse query; telemetry-specific flows still use hasIngested only.
+    refetchInterval: (query) =>
+      query.state.data?.project?.hasIngested || query.state.data?.project?.hasSentryIssues
+        ? false
+        : 10_000,
   });
 }
 
@@ -1627,8 +1634,14 @@ export function sentryProjectEndpoints(projectId: string) {
   return {
     installation: `${base}/installation`,
     installUrl: `${base}/install-url`,
+    importOpenIssues: `${base}/import-open-issues`,
     uninstall: `${base}/uninstall`,
   };
+}
+
+function requiredSentryProjectId(projectId: string | undefined): string {
+  if (!projectId) throw new Error("Sentry project context is required");
+  return projectId;
 }
 
 export function useSentryInstallation(projectId: string | undefined) {
@@ -1636,18 +1649,23 @@ export function useSentryInstallation(projectId: string | undefined) {
   return useQuery({
     queryKey: ["sentry-installation", projectId],
     queryFn: () =>
-      fetcher<SentryInstallation>(sentryProjectEndpoints(projectId!).installation),
+      fetcher<SentryInstallation>(
+        sentryProjectEndpoints(requiredSentryProjectId(projectId)).installation,
+      ),
     enabled: !!projectId,
   });
 }
 
-export function useStartSentryInstall(projectId: string | undefined) {
+export function useStartSentryInstall(
+  projectId: string | undefined,
+  returnTo: "settings" | "onboarding" = "settings",
+) {
   const fetcher = useFetcher();
   return useMutation({
     mutationFn: (projectSlug: string) =>
-      fetcher<{ url: string }>(sentryProjectEndpoints(projectId!).installUrl, {
+      fetcher<{ url: string }>(sentryProjectEndpoints(requiredSentryProjectId(projectId)).installUrl, {
         method: "POST",
-        body: JSON.stringify({ projectSlug }),
+        body: JSON.stringify({ projectSlug, returnTo }),
       }),
   });
 }
@@ -1657,9 +1675,24 @@ export function useUninstallSentry(projectId: string | undefined) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: () =>
-      fetcher<{ ok: true }>(sentryProjectEndpoints(projectId!).uninstall, { method: "POST" }),
+      fetcher<{ ok: true }>(sentryProjectEndpoints(requiredSentryProjectId(projectId)).uninstall, {
+        method: "POST",
+      }),
     onSuccess: () =>
       qc.invalidateQueries({ queryKey: ["sentry-installation", projectId] }),
+  });
+}
+
+export function useImportOpenSentryIssues(projectId: string | undefined) {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      fetcher<{ imported: number }>(
+        sentryProjectEndpoints(requiredSentryProjectId(projectId)).importOpenIssues,
+        { method: "POST" },
+      ),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["me"] }),
   });
 }
 
