@@ -68,11 +68,18 @@ export type GroupingNewIssue = {
   traceId: string | null;
   spanId: string | null;
   resourceAttrs?: ResourceAttrs;
+  /** Log-record attributes from the sample (code location, route, …). */
+  logAttrs?: Record<string, string> | null;
 };
 
 export type GroupingVerdict =
   | { decision: "join"; incidentId: string; evidence: string }
-  | { decision: "standalone"; evidence: string | null };
+  | { decision: "standalone"; evidence: string | null; mechanicalFailure?: GroupingMechanicalFailure };
+
+// A mechanical failure means the agent never reached a real verdict (loop
+// budget ran out, or the model replied with unparseable text). Callers must
+// treat these as retryable errors — not as a considered "standalone" decision.
+export type GroupingMechanicalFailure = "budget_exhausted" | "no_tool_call";
 
 export function environmentForResourceAttrs(attrs: ResourceAttrs | undefined): string | null {
   if (!attrs) return null;
@@ -213,15 +220,18 @@ export function parseSearchInput(input: unknown): SearchInput {
 // Standalone text the LLM-text fallback parser checks. Distinct from the
 // structured tool-input parser because the model can opt out of tools and
 // reply with raw JSON — we still want to honour a valid verdict in that case.
+// Returns null when the reply is not a verdict at all (unparseable text,
+// non-object JSON, or an object without an explicit decision) so the caller
+// can distinguish "no verdict" from a valid standalone without evidence.
 export function parseVerdictFromText(
   raw: string,
   candidateIds: ReadonlySet<string>,
-): GroupingVerdict {
+): GroupingVerdict | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return { decision: "standalone", evidence: null };
+    return null;
   }
   return interpretVerdictPayload(parsed, candidateIds);
 }
@@ -229,10 +239,8 @@ export function parseVerdictFromText(
 function interpretVerdictPayload(
   parsed: unknown,
   candidateIds: ReadonlySet<string>,
-): GroupingVerdict {
-  if (!parsed || typeof parsed !== "object") {
-    return { decision: "standalone", evidence: null };
-  }
+): GroupingVerdict | null {
+  if (!parsed || typeof parsed !== "object") return null;
   const obj = parsed as Record<string, unknown>;
   if (obj.decision === "join") {
     const incidentId = typeof obj.incidentId === "string" ? obj.incidentId : "";
@@ -240,8 +248,10 @@ function interpretVerdictPayload(
     if (candidateIds.has(incidentId) && evidence.length >= MIN_EVIDENCE_LENGTH) {
       return { decision: "join", incidentId, evidence };
     }
+    // An explicit join we can't honour degrades to standalone, as before.
     return { decision: "standalone", evidence: null };
   }
+  if (obj.decision !== "standalone") return null;
   const evidence =
     typeof obj.evidence === "string" && obj.evidence.trim().length > 0
       ? obj.evidence.trim()

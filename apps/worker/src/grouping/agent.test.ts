@@ -207,7 +207,16 @@ test("runGroupingAgent: text-only fallback parses JSON verdict from text", async
   assert.equal(verdict.decision, "join");
 });
 
-test("runGroupingAgent: text-only with non-JSON returns standalone with explanatory evidence", async () => {
+test("runGroupingAgent: raw standalone JSON without evidence is honoured, not a failure", async () => {
+  const deps = makeDeps([[textBlock('{"decision": "standalone"}')]]);
+  const verdict = await runGroupingAgent(
+    { projectName: "p", newIssue: NEW_ISSUE, candidates: [makeCandidate("a")] },
+    deps,
+  );
+  assert.deepEqual(verdict, { decision: "standalone", evidence: null });
+});
+
+test("runGroupingAgent: text-only with non-JSON is a mechanical failure, not a verdict", async () => {
   const deps = makeDeps([[textBlock("I'd rather not say")]]);
   const verdict = await runGroupingAgent(
     { projectName: "p", newIssue: NEW_ISSUE, candidates: [makeCandidate("a")] },
@@ -216,6 +225,7 @@ test("runGroupingAgent: text-only with non-JSON returns standalone with explanat
   assert.deepEqual(verdict, {
     decision: "standalone",
     evidence: "Model did not call a grouping tool.",
+    mechanicalFailure: "no_tool_call",
   });
 });
 
@@ -231,6 +241,7 @@ test("runGroupingAgent: exhausts iteration budget → standalone with budget mes
   assert.deepEqual(verdict, {
     decision: "standalone",
     evidence: "Grouping agent exhausted its tool-use budget without a valid decision.",
+    mechanicalFailure: "budget_exhausted",
   });
 });
 

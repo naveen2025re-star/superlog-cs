@@ -51,10 +51,13 @@ test("dispatcher enqueues the transition instead of running it inline", async ()
   assert.equal(inlineRuns, 0, "inline handler must not run when the queue is available");
   assert.equal(fb.sent.length, 1);
   assert.equal(fb.sent[0]?.name, ISSUE_TRANSITION_QUEUE);
-  assert.deepEqual(fb.sent[0]?.data, {
+  const sentData = fb.sent[0]?.data as { enqueuedAtMs?: number };
+  assert.equal(typeof sentData.enqueuedAtMs, "number");
+  assert.deepEqual({ ...sentData, enqueuedAtMs: undefined }, {
     issueId: "issue-1",
     projectId: "project-1",
     transition: "new",
+    enqueuedAtMs: undefined,
   });
   // Rapid duplicate dispatches of the same (issue, transition) must dedupe
   // while a matching job is still queued.
@@ -174,10 +177,13 @@ test("observation escalations dispatch through the queue too", async () => {
 
   await dispatch(issueOf("issue-1", "project-1"), "escalated");
 
-  assert.deepEqual(fb.sent[0]?.data, {
+  const escData = fb.sent[0]?.data as { enqueuedAtMs?: number };
+  assert.equal(typeof escData.enqueuedAtMs, "number");
+  assert.deepEqual({ ...escData, enqueuedAtMs: undefined }, {
     issueId: "issue-1",
     projectId: "project-1",
     transition: "escalated",
+    enqueuedAtMs: undefined,
   });
 
   const handled: string[] = [];
@@ -212,4 +218,37 @@ test("the queue worker skips malformed job payloads", async () => {
   ]);
 
   assert.deepEqual(handled, ["issue-2"]);
+});
+
+test("worker serializes same-project transitions and parallelizes across projects", async () => {
+  const fb = fakeBoss();
+  const events: string[] = [];
+  let releaseFirst: () => void = () => {};
+  const firstGate = new Promise<void>((resolve) => (releaseFirst = resolve));
+  let calls = 0;
+  await registerIssueTransitionWorker(fb.boss, {
+    handle: async (issue) => {
+      const n = ++calls;
+      events.push(`start:${issue.id}`);
+      if (n === 1) await firstGate; // hold the first proj-A job mid-flight
+      events.push(`end:${issue.id}`);
+    },
+    loadIssue: async (id) => issueOf(id, id.startsWith("a") ? "proj-A" : "proj-B"),
+  });
+
+  const worker = fb.workers.get(ISSUE_TRANSITION_QUEUE);
+  assert.ok(worker);
+  // Simulate three concurrent consumers: two proj-A jobs, one proj-B job.
+  const j1 = worker([{ id: "j1", data: { issueId: "a-1", projectId: "proj-A", transition: "new" } }]);
+  const j2 = worker([{ id: "j2", data: { issueId: "a-2", projectId: "proj-A", transition: "new" } }]);
+  const j3 = worker([{ id: "j3", data: { issueId: "b-1", projectId: "proj-B", transition: "new" } }]);
+  await j3; // proj-B completes while proj-A's first job is still held
+  assert.ok(events.includes("end:b-1"), "different project must not wait");
+  assert.ok(!events.includes("start:a-2"), "second proj-A job must wait for the first");
+  releaseFirst();
+  await Promise.all([j1, j2]);
+  assert.deepEqual(
+    events.filter((e) => e.includes("a-")),
+    ["start:a-1", "end:a-1", "start:a-2", "end:a-2"],
+  );
 });

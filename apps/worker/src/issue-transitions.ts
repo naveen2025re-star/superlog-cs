@@ -17,9 +17,28 @@
 // at-most-once. The inline path logged-and-skipped a throwing handler; the
 // queue worker does the same per job instead of relying on pg-boss retries,
 // because the handler is not written to be safely re-runnable in all cases.
+import { metrics } from "@opentelemetry/api";
 import type { schema } from "@superlog/db";
 import type { IssueTransition } from "./incidents/workflow.js";
 import { logger as defaultLogger } from "./logger.js";
+
+// Queue-health telemetry: how long a transition waited before a consumer
+// picked it up, and how long the side effects took. Queue lag growing past
+// tens of seconds means the LLM grouping calls are outpacing WORKER_CONCURRENCY
+// — the signal to scale consumers or shed load, watched via a product alert.
+const meter = metrics.getMeter("@superlog/worker/issue-transitions");
+const queueLagHistogram = meter.createHistogram("superlog.issue_transitions.queue_lag_ms", {
+  description: "Delay between enqueueing an issue transition and a consumer starting it.",
+  unit: "ms",
+});
+const durationHistogram = meter.createHistogram("superlog.issue_transitions.duration_ms", {
+  description: "Wall-clock duration of issue-transition side effects (incident intake, grouping, notifications).",
+  unit: "ms",
+});
+const failureCounter = meter.createCounter("superlog.issue_transitions.failures", {
+  description: "Issue transitions whose side effects threw and were skipped (at-most-once).",
+  unit: "1",
+});
 
 export const ISSUE_TRANSITION_QUEUE = "issue-transition";
 
@@ -42,6 +61,8 @@ export type IssueTransitionJobData = {
   issueId: string;
   projectId: string;
   transition: IssueTransition;
+  /** Epoch ms at enqueue; lets the consumer report queue lag. */
+  enqueuedAtMs?: number;
 };
 
 type LoggerLike = Pick<typeof defaultLogger, "warn" | "error">;
@@ -73,6 +94,7 @@ function parseJobData(data: unknown): IssueTransitionJobData | null {
     issueId: record.issueId,
     projectId: record.projectId,
     transition: record.transition,
+    enqueuedAtMs: typeof record.enqueuedAtMs === "number" ? record.enqueuedAtMs : undefined,
   };
 }
 
@@ -105,6 +127,7 @@ export function createIssueTransitionDispatcher(opts: {
       issueId: issue.id,
       projectId: issue.projectId,
       transition,
+      enqueuedAtMs: Date.now(),
     };
     try {
       // singletonKey dedupes while a matching job is queued: a rapid
@@ -129,10 +152,33 @@ export function createIssueTransitionDispatcher(opts: {
   };
 }
 
+// Per-project serialization. Transitions for the SAME project run strictly
+// one at a time (burst siblings group sequentially, so the second issue of a
+// storm sees the incident the first one just created), while different
+// projects keep using the full consumer concurrency. In-process only: the
+// worker runs as a single process; if it ever scales out, cross-process
+// races return (degrading to pre-lock behavior, never worse).
+function createKeyedMutex(): <T>(key: string, fn: () => Promise<T>) => Promise<T> {
+  const tails = new Map<string, Promise<unknown>>();
+  return async function withKey<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = tails.get(key) ?? Promise.resolve();
+    const next = prev.then(fn, fn);
+    const stored = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    tails.set(key, stored);
+    void stored.then(() => {
+      if (tails.get(key) === stored) tails.delete(key);
+    });
+    return next;
+  };
+}
+
 // Register the queue and its worker. Each consumer processes one job at a
 // time; a job's failure is logged and swallowed (at-most-once, matching the
 // previous inline behavior) so one poisoned transition can't wedge or re-run
-// the rest.
+// the rest. Same-project jobs additionally serialize behind each other.
 export async function registerIssueTransitionWorker(
   boss: Pick<TransitionQueueBoss, "createQueue" | "work">,
   opts: {
@@ -142,6 +188,7 @@ export async function registerIssueTransitionWorker(
   },
 ): Promise<void> {
   const logger = opts.logger ?? defaultLogger;
+  const perProject = createKeyedMutex();
   await boss.createQueue(ISSUE_TRANSITION_QUEUE);
   await boss.work(
     ISSUE_TRANSITION_QUEUE,
@@ -157,6 +204,12 @@ export async function registerIssueTransitionWorker(
             );
             return;
           }
+          if (data.enqueuedAtMs) {
+            queueLagHistogram.record(Math.max(0, Date.now() - data.enqueuedAtMs), {
+              transition: data.transition,
+            });
+          }
+          const startedAt = Date.now();
           try {
             const issue = await opts.loadIssue(data.issueId);
             if (!issue) {
@@ -166,8 +219,9 @@ export async function registerIssueTransitionWorker(
               );
               return;
             }
-            await opts.handle(issue, data.transition);
+            await perProject(data.projectId, () => opts.handle(issue, data.transition));
           } catch (err) {
+            failureCounter.add(1, { transition: data.transition });
             logger.error(
               {
                 scope: "issue-transitions",
@@ -178,6 +232,8 @@ export async function registerIssueTransitionWorker(
               },
               "issue transition failed; skipping",
             );
+          } finally {
+            durationHistogram.record(Date.now() - startedAt, { transition: data.transition });
           }
         }),
       );
