@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   candidatePreview,
   inspectCandidate,
+  inspectCandidateResult,
   listIncidentFacets,
   listIncidentTitles,
   searchCandidates,
@@ -50,6 +51,27 @@ test("candidatePreview includes services, environments, latestInvestigation summ
     completedAt: "2026-05-22T01:00:00Z",
     selectedRepoFullName: "org/repo",
   });
+});
+
+test("candidatePreview compacts an oversized diagnostic message", () => {
+  const headline = 'Failed to resolve import "./missing.png" from "app/feature.tsx"';
+  const candidate = makeCandidate({
+    representative: {
+      exceptionType: "Error",
+      message: `${headline}\n${"generatedCall();".repeat(40_000)}\nat normalizeUrl`,
+      topFrame: "normalizeUrl",
+      normalizedFrames: ["normalizeUrl"],
+      traceId: null,
+      spanId: null,
+    },
+  });
+
+  const preview = candidatePreview(candidate);
+
+  assert.ok((preview.representative?.message?.length ?? 0) <= 1_000);
+  assert.match(preview.representative?.message ?? "", /Failed to resolve import/);
+  assert.match(preview.representative?.message ?? "", /omitted [\d,]+ chars/);
+  assert.match(preview.representative?.message ?? "", /at normalizeUrl/);
 });
 
 test("listIncidentTitles filters by service and caps to limit", () => {
@@ -198,4 +220,86 @@ test("inspectCandidate returns the candidate when id matches, error otherwise", 
   assert.deepEqual(inspectCandidate(candidates, { incident_id: "ghost" }), {
     error: "unknown incident_id: ghost",
   });
+});
+
+test("inspectCandidate bounds oversized messages while retaining detailed context", () => {
+  const headline = 'Failed to resolve import "./missing.png" from "app/feature.tsx"';
+  const message = `${headline}\n${"generatedCall();".repeat(40_000)}\nat normalizeUrl`;
+  const candidate = makeCandidate({
+    representative: {
+      exceptionType: "Error",
+      message,
+      topFrame: "normalizeUrl",
+      normalizedFrames: ["normalizeUrl"],
+      traceId: null,
+      spanId: null,
+    },
+    issues: [
+      {
+        id: "issue-1",
+        title: headline,
+        service: "web",
+        exceptionType: "Error",
+        message,
+        topFrame: "normalizeUrl",
+        normalizedFrames: ["normalizeUrl"],
+        traceId: null,
+        spanId: null,
+        lastSeen: "2026-05-23T00:00:00Z",
+      },
+    ],
+  });
+
+  const inspected = inspectCandidate([candidate], { incident_id: "inc-1" }) as typeof candidate;
+
+  assert.ok((inspected.representative?.message?.length ?? 0) <= 12_000);
+  assert.ok((inspected.issues?.[0]?.message?.length ?? 0) <= 12_000);
+  assert.match(inspected.issues?.[0]?.message ?? "", /Failed to resolve import/);
+  assert.match(inspected.issues?.[0]?.message ?? "", /omitted [\d,]+ chars/);
+  assert.match(inspected.issues?.[0]?.message ?? "", /at normalizeUrl/);
+  assert.equal(
+    candidate.issues?.[0]?.message,
+    message,
+    "tool projection must not mutate source data",
+  );
+});
+
+test("inspectCandidateResult enforces a whole-result budget and keeps diagnostic edges", () => {
+  const headline = 'Failed to resolve import "./missing.png" from "app/feature.tsx"';
+  const message = `${headline}\n${"generatedCall();".repeat(40_000)}\nat normalizeUrl`;
+  const candidate = makeCandidate({
+    representative: {
+      exceptionType: "Error",
+      message,
+      topFrame: "normalizeUrl",
+      normalizedFrames: ["normalizeUrl"],
+      traceId: null,
+      spanId: null,
+    },
+    issues: Array.from({ length: 5 }, (_, index) => ({
+      id: `issue-${index}`,
+      title: headline,
+      service: "web",
+      exceptionType: "Error",
+      message,
+      topFrame: "normalizeUrl",
+      normalizedFrames: ["normalizeUrl"],
+      traceId: null,
+      spanId: null,
+      lastSeen: "2026-05-23T00:00:00Z",
+    })),
+  });
+
+  const result = inspectCandidateResult([candidate], { incident_id: "inc-1" }, 20_000);
+  const parsed = JSON.parse(result) as {
+    truncated: boolean;
+    representative: { message: string };
+    issues: Array<{ id: string; message: string }>;
+  };
+
+  assert.ok(result.length <= 20_000, `inspection result was ${result.length}`);
+  assert.equal(parsed.truncated, true);
+  assert.match(parsed.representative.message, /Failed to resolve import/);
+  assert.equal(parsed.issues[4]?.id, "issue-4");
+  assert.match(parsed.issues[4]?.message ?? "", /at normalizeUrl/);
 });
