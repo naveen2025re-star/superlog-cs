@@ -423,8 +423,6 @@ test("complete_investigation is rejected for PR runs but allowed for findings-on
     isCompleteInvestigationAllowed(result, {
       prPolicy: "always",
       githubConnected: true,
-      approvalPromptsEnabled: false,
-      approvalPromptToolsAvailable: false,
     }),
     false,
   );
@@ -432,8 +430,6 @@ test("complete_investigation is rejected for PR runs but allowed for findings-on
     isCompleteInvestigationAllowed(result, {
       prPolicy: "never",
       githubConnected: true,
-      approvalPromptsEnabled: true,
-      approvalPromptToolsAvailable: true,
     }),
     true,
   );
@@ -441,42 +437,53 @@ test("complete_investigation is rejected for PR runs but allowed for findings-on
     isCompleteInvestigationAllowed(result, {
       prPolicy: "on_ready_to_pr",
       githubConnected: false,
-      approvalPromptsEnabled: false,
-      approvalPromptToolsAvailable: true,
     }),
     true,
   );
 });
 
-test("legacy sessions do not advertise completion tools absent from their schema", () => {
-  assert.equal(
-    completeInvestigationAvailable({
-      prPolicy: "never",
-      githubConnected: true,
-      approvalPromptsEnabled: true,
-      approvalPromptToolsAvailable: true,
-    }),
-    false,
-  );
-});
-
-test("an explicit Linear handoff is allowed when another intervention is available", () => {
+test("persisted legacy Linear handoffs can drain after the tool contract changes", () => {
   assert.equal(
     isCompleteInvestigationAllowed(
       {
         state: "complete",
-        summary: "Findings ready for the owning team.",
+        summary: "Findings ready.",
         completionKind: "investigation_complete",
         linearTicketRequested: true,
       },
       {
         prPolicy: "always",
         githubConnected: true,
-        approvalPromptsEnabled: true,
-        approvalPromptToolsAvailable: true,
       },
     ),
     true,
+  );
+});
+
+test("findings-only completion remains available alongside approval prompts when PRs are disabled", () => {
+  assert.equal(
+    completeInvestigationAvailable({
+      prPolicy: "never",
+      githubConnected: true,
+    }),
+    true,
+  );
+});
+
+test("findings-only completion cannot bypass the PR-creation guard", () => {
+  assert.equal(
+    isCompleteInvestigationAllowed(
+      {
+        state: "complete",
+        summary: "Findings ready for the owning team.",
+        completionKind: "investigation_complete",
+      },
+      {
+        prPolicy: "always",
+        githubConnected: true,
+      },
+    ),
+    false,
   );
 });
 
@@ -838,24 +845,33 @@ test("terminalOutcomeNudgePrompt uses complete_investigation when interventions 
   assert.doesNotMatch(prompt, /propose_pr/);
 });
 
-test("terminalOutcomeNudgePrompt preserves the explicit Linear handoff", () => {
+test("terminalOutcomeNudgePrompt exposes complete_investigation for findings-only handoff", () => {
   const prompt = terminalOutcomeNudgePrompt({
     completeInvestigationAvailable: true,
-    linearTicketCreationAvailable: true,
     prCreationAvailable: false,
   });
-  assert.match(prompt, /create_linear_issue/);
-  assert.doesNotMatch(prompt, /complete_investigation/);
+  assert.match(prompt, /complete_investigation/);
+  assert.doesNotMatch(prompt, /create_linear_issue/);
   assert.doesNotMatch(prompt, /propose_pr/);
 });
 
-test("terminalOutcomeNudgePrompt keeps PR creation alongside the Linear handoff", () => {
+test("terminalOutcomeNudgePrompt does not expose findings-only completion with PR creation", () => {
   const prompt = terminalOutcomeNudgePrompt({
     completeInvestigationAvailable: false,
-    linearTicketCreationAvailable: true,
+    prCreationAvailable: true,
+  });
+  assert.doesNotMatch(prompt, /complete_investigation/);
+  assert.doesNotMatch(prompt, /create_linear_issue/);
+  assert.match(prompt, /propose_pr/);
+});
+
+test("terminalOutcomeNudgePrompt names the frozen handoff terminal for legacy sessions", () => {
+  const prompt = terminalOutcomeNudgePrompt({
+    legacyLinearHandoffAvailable: true,
     prCreationAvailable: true,
   });
   assert.match(prompt, /create_linear_issue/);
+  assert.doesNotMatch(prompt, /complete_investigation/);
   assert.match(prompt, /propose_pr/);
 });
 
@@ -867,24 +883,33 @@ test("terminalOutcomeNudgeCapabilities uses the tools declared for the running s
     ),
     {
       prCreationAvailable: true,
-      linearTicketCreationAvailable: false,
       completeInvestigationAvailable: false,
     },
   );
   assert.deepEqual(
     terminalOutcomeNudgeCapabilities(
-      { declaredCustomToolNames: ["report_findings", "create_linear_issue"] },
+      { declaredCustomToolNames: ["report_findings", "complete_investigation"] },
       { prCreationAvailable: true, completeInvestigationAvailable: false },
     ),
     {
       prCreationAvailable: false,
-      linearTicketCreationAvailable: true,
+      completeInvestigationAvailable: true,
+    },
+  );
+  assert.deepEqual(
+    terminalOutcomeNudgeCapabilities(
+      { declaredCustomToolNames: ["report_findings", "propose_pr", "create_linear_issue"] },
+      { prCreationAvailable: false, completeInvestigationAvailable: true },
+    ),
+    {
+      prCreationAvailable: true,
       completeInvestigationAvailable: false,
+      legacyLinearHandoffAvailable: true,
     },
   );
 });
 
-test("terminalOutcomeNudgeCapabilities does not add Linear to legacy snapshots", () => {
+test("terminalOutcomeNudgeCapabilities preserves legacy fallback tool availability", () => {
   assert.deepEqual(
     terminalOutcomeNudgeCapabilities(
       {},
@@ -892,7 +917,6 @@ test("terminalOutcomeNudgeCapabilities does not add Linear to legacy snapshots",
     ),
     {
       prCreationAvailable: true,
-      linearTicketCreationAvailable: false,
       completeInvestigationAvailable: false,
     },
   );

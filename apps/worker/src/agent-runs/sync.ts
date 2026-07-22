@@ -122,11 +122,12 @@ export function isCompleteInvestigationAllowed(
   capabilities: {
     prPolicy: schema.PrPolicy;
     githubConnected: boolean;
-    approvalPromptsEnabled: boolean;
-    approvalPromptToolsAvailable: boolean;
   },
 ): boolean {
   if (result.completionKind !== "investigation_complete") return true;
+  // Pre-cutover sessions persisted this flag for the provider-specific handoff
+  // terminal. Let those immutable snapshots drain even when PR creation would
+  // block a newly declared complete_investigation call.
   if (result.linearTicketRequested) return true;
   const prCreation = capabilities.githubConnected && capabilities.prPolicy !== "never";
   return !prCreation;
@@ -135,13 +136,9 @@ export function isCompleteInvestigationAllowed(
 export function completeInvestigationAvailable(capabilities: {
   prPolicy: schema.PrPolicy;
   githubConnected: boolean;
-  approvalPromptsEnabled: boolean;
-  approvalPromptToolsAvailable: boolean;
 }): boolean {
   const prCreation = capabilities.githubConnected && capabilities.prPolicy !== "never";
-  const approvalPrompts =
-    capabilities.approvalPromptsEnabled && capabilities.approvalPromptToolsAvailable;
-  return !prCreation && !approvalPrompts;
+  return !prCreation;
 }
 
 const agentRunLifecycle = createAgentRunLifecycle(db);
@@ -443,15 +440,20 @@ export function shouldDeferSteering(snapshot: {
 export function terminalOutcomeNudgePrompt(
   args: {
     completeInvestigationAvailable?: boolean;
-    linearTicketCreationAvailable?: boolean;
+    legacyLinearHandoffAvailable?: boolean;
     prCreationAvailable?: boolean;
   } = {},
 ): string {
   const terminalTools: string[] = [];
-  const prCreationAvailable = args.prCreationAvailable ?? !args.completeInvestigationAvailable;
+  const prCreationAvailable =
+    args.prCreationAvailable ??
+    !(args.completeInvestigationAvailable || args.legacyLinearHandoffAvailable);
   if (prCreationAvailable) terminalTools.push("batched `propose_pr`");
-  if (args.linearTicketCreationAvailable) terminalTools.push("`create_linear_issue`");
-  else if (args.completeInvestigationAvailable) terminalTools.push("`complete_investigation`");
+  if (args.completeInvestigationAvailable) {
+    terminalTools.push("`complete_investigation`");
+  } else if (args.legacyLinearHandoffAvailable) {
+    terminalTools.push("`create_linear_issue` (legacy session compatibility)");
+  }
   terminalTools.push(
     "`resolve_incident` with all Issue outcomes",
     "`report_external_cause`",
@@ -471,8 +473,8 @@ export function terminalOutcomeNudgeCapabilities(
   },
 ): {
   prCreationAvailable: boolean;
-  linearTicketCreationAvailable: boolean;
   completeInvestigationAvailable: boolean;
+  legacyLinearHandoffAvailable?: true;
 } {
   const declared = snapshot.declaredCustomToolNames;
   if (!declared) {
@@ -483,16 +485,13 @@ export function terminalOutcomeNudgeCapabilities(
       },
       "terminal outcome nudge is using legacy snapshot capabilities",
     );
-    return {
-      ...fallback,
-      linearTicketCreationAvailable: false,
-    };
+    return fallback;
   }
   const names = new Set(declared);
   return {
     prCreationAvailable: names.has("propose_pr"),
-    linearTicketCreationAvailable: names.has("create_linear_issue"),
     completeInvestigationAvailable: names.has("complete_investigation"),
+    ...(names.has("create_linear_issue") ? { legacyLinearHandoffAvailable: true as const } : {}),
   };
 }
 
@@ -1312,8 +1311,6 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
         !isCompleteInvestigationAllowed(snapshot.result, {
           prPolicy: ctx.prPolicy,
           githubConnected: ctx.githubInstalls.length > 0,
-          approvalPromptsEnabled: ctx.approvalPromptsEnabled,
-          approvalPromptToolsAvailable: true,
         })
       ) {
         const failed = await failAgentRun(
@@ -1564,8 +1561,6 @@ export async function syncRunningAgentRun(ctx: AgentRunContext): Promise<void> {
               completeInvestigationAvailable: completeInvestigationAvailable({
                 prPolicy: ctx.prPolicy,
                 githubConnected: ctx.githubInstalls.length > 0,
-                approvalPromptsEnabled: ctx.approvalPromptsEnabled,
-                approvalPromptToolsAvailable: true,
               }),
               prCreationAvailable: ctx.githubInstalls.length > 0 && ctx.prPolicy !== "never",
             }),
