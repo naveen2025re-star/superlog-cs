@@ -3023,15 +3023,28 @@ app.post("/api/projects/:projectId/incidents/:incidentId/agent-run/restart", asy
     throw new HTTPException(400, { message: "incident agent_runs are disabled" });
   }
 
+  const body = (await c.req.json().catch(() => ({}))) as {
+    expectedLatestRunId?: unknown;
+  };
+  const expectedLatestRunId =
+    typeof body.expectedLatestRunId === "string" ? body.expectedLatestRunId.trim() : "";
+  if (!expectedLatestRunId) {
+    throw new HTTPException(400, { message: "expectedLatestRunId is required" });
+  }
+
   const restart = await restartAgentRun(db, {
     incidentId: incident.id,
     runtime: automation.agentRunProvider,
+    expectedLatestRunId,
   });
   if (restart.outcome === "no_prior_run") {
     throw new HTTPException(404, { message: "agent run not found" });
   }
   if (restart.outcome === "incident_not_open") {
     throw new HTTPException(409, { message: "incident is no longer open" });
+  }
+  if (restart.outcome === "latest_run_changed") {
+    throw new HTTPException(409, { message: "agent run changed before restart" });
   }
 
   return c.json(restart.agentRun);
