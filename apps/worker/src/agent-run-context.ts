@@ -23,6 +23,15 @@ export type InstalledGithubRepo = {
   installation: schema.GithubInstallation;
 };
 
+export class PartialGithubRepoDiscoveryError extends Error {
+  constructor(cause: unknown) {
+    super("some GitHub installations failed before repository access could be determined", {
+      cause,
+    });
+    this.name = "PartialGithubRepoDiscoveryError";
+  }
+}
+
 type GithubRepoAccess = {
   disabledRepoIds?: number[];
 };
@@ -359,17 +368,18 @@ function isGithubRepoEnabled(repoAccess: GithubRepoAccess, repoId: number): bool
 export async function listAccessibleGithubRepositories(
   // Only the installs are needed — chats (no incident) share this path.
   ctx: Pick<AgentRunContext, "githubInstalls">,
-  deps: {
-    listInstallationRepositories: typeof listInstallationRepositories;
-  } = { listInstallationRepositories },
+  options: {
+    listInstallationRepositories?: typeof listInstallationRepositories;
+  } = {},
 ): Promise<InstalledGithubRepo[]> {
+  const listRepositories = options.listInstallationRepositories ?? listInstallationRepositories;
   const results = await Promise.all(
     ctx.githubInstalls
       .filter(({ installation }) => installation.agentEnabled)
       .map(async ({ installation, allowedRepoIds }) => {
         try {
           const repoAccess = normalizeGithubRepoAccess(installation.repoAccess);
-          const repos = await deps.listInstallationRepositories(installation.installationId);
+          const repos = await listRepositories(installation.installationId);
           const grantSet = allowedRepoIds === null ? null : new Set(allowedRepoIds);
           return {
             repos: repos
@@ -393,8 +403,12 @@ export async function listAccessibleGithubRepositories(
   );
 
   const repos = dedupeInstalledGithubRepos(results.flatMap((result) => result.repos));
-  if (repos.length === 0 && results.some((result) => result.err)) {
+  const errors = results.filter((result) => result.err);
+  if (repos.length === 0 && errors.length > 0) {
     const firstError = results.find((result) => result.err)?.err;
+    if (errors.length < results.length) {
+      throw new PartialGithubRepoDiscoveryError(firstError);
+    }
     throw firstError instanceof Error
       ? firstError
       : new Error("failed to list repositories for all GitHub installations");

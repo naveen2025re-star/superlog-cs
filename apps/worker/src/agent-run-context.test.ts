@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { schema } from "@superlog/db";
 import {
+  PartialGithubRepoDiscoveryError,
   buildFollowUpContext,
   effectivePrPolicyForAgentRun,
   listAccessibleGithubRepositories,
@@ -200,7 +201,7 @@ test("repository discovery surfaces failure when every enabled installation erro
   );
 });
 
-test("repository discovery surfaces failure when successful installs have no usable repos", async () => {
+test("repository lookup preserves a partial failure when successful installs have no usable repos", async () => {
   const githubUnavailable = new Error("github returned 503");
   const githubInstalls = [
     {
@@ -233,6 +234,10 @@ test("repository discovery surfaces failure when successful installs have no usa
         },
       },
     ),
-    githubUnavailable,
+    (error) => {
+      assert.ok(error instanceof PartialGithubRepoDiscoveryError);
+      assert.equal(error.cause, githubUnavailable);
+      return true;
+    },
   );
 });
