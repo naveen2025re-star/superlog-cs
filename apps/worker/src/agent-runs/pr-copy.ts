@@ -13,7 +13,7 @@ type PrCopyPr = {
   body?: string | null;
 };
 
-function withSuperlogPrefix(title: string): string {
+export function buildLegacyPrReceiptTitle(title: string): string {
   const trimmed = title.trim();
   return trimmed.startsWith("[superlog]") ? trimmed : `[superlog] ${trimmed}`;
 }
@@ -24,10 +24,12 @@ export function buildPrTitle(opts: {
   pr: PrCopyPr;
 }): string {
   const explicit = opts.pr.title?.trim();
-  if (explicit) return withSuperlogPrefix(explicit);
+  // The explicit title already reflects repository and organization guidance;
+  // delivery must not silently override required or forbidden conventions.
+  if (explicit) return explicit;
   const proposed = opts.result.proposedTitle?.trim();
-  if (proposed) return withSuperlogPrefix(proposed);
-  return withSuperlogPrefix(opts.ctx.incident.title);
+  if (proposed) return buildLegacyPrReceiptTitle(proposed);
+  return buildLegacyPrReceiptTitle(opts.ctx.incident.title);
 }
 
 export function buildPrBody(opts: {
